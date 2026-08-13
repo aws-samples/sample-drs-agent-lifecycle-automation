@@ -1,0 +1,45 @@
+# =============================================================================
+# DRS Agent Lifecycle Automation - Configuration
+# =============================================================================
+# Update these values for your environment before running scripts/deploy.sh.
+# All values are referenced by the deployment scripts and CloudFormation templates.
+# =============================================================================
+
+# --- Region Configuration ---------------------------------------------------
+source_region: us-west-1          # Region where your EC2 instances run
+dr_region: us-east-2              # DR region where DRS replicates to
+account_id: "123456789012"        # Your AWS account ID
+
+# --- Observability -----------------------------------------------------------
+sns_topic_name: drs-alerts        # SNS topic name for notifications (created separately)
+audit_bucket_name: ""             # S3 bucket for JSON audit logs (empty = skip audit)
+cloudwatch_namespace: DRSAutomation  # CloudWatch metric namespace
+
+# --- Automation Toggles ------------------------------------------------------
+# IMPORTANT: Start with auto_install_enabled=false (audit mode) to validate
+# the automation detects instances correctly before enabling auto-install.
+auto_install_enabled: "false"     # false = audit-only (detect + report); true = install/repair
+auto_offboard_enabled: "true"     # true = execute teardown on descope; false = notify only
+
+# --- Tag Configuration -------------------------------------------------------
+dr_tag_key: DR                    # EC2 tag key that controls the lifecycle
+dr_protected_value: "yes"         # Tag value = instance is protected (onboard/heal)
+dr_descope_value: "no"            # Tag value = instance is descoped (offboard)
+
+# --- Stand-Down Control ------------------------------------------------------
+# Set this parameter to "true" during failover/failback to pause ALL automation.
+stand_down_parameter: /drs/control/event-in-progress
+
+# --- State Manager -----------------------------------------------------------
+schedule_rate: "rate(30 minutes)" # How often State Manager checks for new DR=yes instances
+
+# --- SSM Document Names ------------------------------------------------------
+onboard_document_name: DRS-Agent-Onboard
+heal_document_name: DRS-Agent-Heal
+offboard_document_name: DRS-Agent-Offboard
+
+# --- CloudFormation Stack Names ----------------------------------------------
+iam_stack_name: drs-automation-iam
+eventbridge_source_stack_name: drs-eventbridge-source
+eventbridge_dr_stack_name: drs-eventbridge-dr
+state_manager_stack_name: drs-state-manager
