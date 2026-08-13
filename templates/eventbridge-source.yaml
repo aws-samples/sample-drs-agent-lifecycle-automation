@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  EventBridge rules in the SOURCE region for DRS Agent Lifecycle Automation.
+  Rule 1: Tag change (DR tag modified) triggers offboarding.
+  Rule 2: Stalled event (forwarded from DR region) triggers self-heal.
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  AutomationRoleArn:
+    Type: String
+    Description: ARN of the DRS-Automation-Role
+    Default: ''
+
+  TargetRegion:
+    Type: String
+    Description: DR region where DRS source servers live
+    Default: us-east-2
+
+  OffboardDocumentName:
+    Type: String
+    Description: Name of the offboard SSM Automation document
+    Default: DRS-Agent-Offboard
+
+  HealDocumentName:
+    Type: String
+    Description: Name of the heal SSM Automation document
+    Default: DRS-Agent-Heal
+
+  DrTagKey:
+    Type: String
+    Description: The EC2 tag key that controls DR lifecycle
+    Default: DR
+
+  SNSTopicArn:
+    Type: String
+    Description: SNS topic ARN for notifications (optional)
+    Default: ''
+
+  AuditBucket:
+    Type: String
+    Description: S3 bucket for audit logs (optional)
+    Default: ''
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Rule 1: EC2 Tag Change → Offboard
+  # Fires when the DR tag is changed or deleted on an EC2 instance.
+  # The offboard document re-checks the tag value (double-gate) before acting.
+  # ---------------------------------------------------------------------------
+  DRSTagChangeOffboardRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: DRS-Tag-Change-Offboard
+      Description: >-
+        Triggers DRS offboarding when the DR tag is changed on an EC2 instance.
+        The SSM document re-validates the tag value before taking action.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.tag
+        detail-type:
+          - Tag Change on Resource
+        detail:
+          service:
+            - ec2
+          resource-type:
+            - instance
+          changed-tag-keys:
+            - !Ref DrTagKey
+      Targets:
+        - Id: DRSOffboardAutomation
+          Arn: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${OffboardDocumentName}'
+          RoleArn: !Ref AutomationRoleArn
+          InputTransformer:
+            InputPathsMap:
+              instance: $.resources[0]
+            InputTemplate: !Sub |
+              {
+                "InstanceTarget": [<instance>],
+                "TargetRegion": ["${TargetRegion}"],
+                "AutoOffboardEnabled": ["true"],
+                "SnsTopicArn": ["${SNSTopicArn}"],
+                "AuditBucket": ["${AuditBucket}"],
+                "AutomationAssumeRole": ["${AutomationRoleArn}"]
+              }
+
+  # ---------------------------------------------------------------------------
+  # Rule 2: Stalled Event (forwarded from DR region) → Heal
+  # The DR region forwards aws.drs STALLED events to the source region bus.
+  # This rule picks them up and triggers the self-heal automation.
+  # ---------------------------------------------------------------------------
+  DRSStalledHealReceiveRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: DRS-Stalled-Heal-Receive
+      Description: >-
+        Receives DRS source server stalled events forwarded from the DR region
+        and triggers the self-heal SSM Automation document.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.drs
+        detail-type:
+          - DRS Source Server Data Replication Stalled Change
+      Targets:
+        - Id: DRSHealAutomation
+          Arn: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${HealDocumentName}'
+          RoleArn: !Ref AutomationRoleArn
+          InputTransformer:
+            InputPathsMap:
+              sourceserver: $.resources[0]
+            InputTemplate: !Sub |
+              {
+                "InstanceTarget": [<sourceserver>],
+                "TargetRegion": ["${TargetRegion}"],
+                "SnsTopicArn": ["${SNSTopicArn}"],
+                "AuditBucket": ["${AuditBucket}"],
+                "AutomationAssumeRole": ["${AutomationRoleArn}"]
+              }
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  TagChangeRuleArn:
+    Description: ARN of the tag-change offboard rule
+    Value: !GetAtt DRSTagChangeOffboardRule.Arn
+
+  StalledHealRuleArn:
+    Description: ARN of the stalled-heal receive rule
+    Value: !GetAtt DRSStalledHealReceiveRule.Arn
