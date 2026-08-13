@@ -1,0 +1,1029 @@
+schemaVersion: '0.3'
+description: >-
+  DRS agent onboarding (Linux + Windows). Instance-state gate, platform routing
+  with a not-managed/unknown-platform alert, supported-platform pre-check,
+  pre-req & reachability checks, hostname preservation, registration-aware
+  health check (incl. reverse/failback detection), install (if needed),
+  failback tagging, validate, and persistent PENDING escalation. Designed to be
+  run by State Manager (tag:DR=yes, rate(30 minutes)) or invoked directly for
+  testing. On-instance work runs via aws:runCommand. Authoritative design: New solution.md
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  InstanceId:
+    type: String
+    description: Target EC2 instance ID (State Manager passes this per target).
+  TargetRegion:
+    type: String
+    default: us-east-2
+    description: DR region the agent replicates to.
+  AutoInstallEnabled:
+    type: String
+    allowedValues: ['true', 'false']
+    default: 'false'
+    description: 'false = audit-only (detect + report); true = install/repair.'
+  AgentRegistrationTimeout:
+    type: String
+    default: '15'
+    description: Minutes to wait for the source server to register in the DR region before reporting PENDING.
+  PendingEscalationThreshold:
+    type: String
+    default: '3'
+    description: Consecutive PENDING_REGISTRATION runs before escalating (alerting) that a DR=yes instance is not registering.
+  StandDownParameter:
+    type: String
+    default: '/drs/control/event-in-progress'
+    description: SSM Parameter Store name of the DR-event stand-down flag. When its value is true, all onboarding/remediation/alerting is paused during a declared DR event.
+  SnsTopicArn:
+    type: String
+    default: ''
+    description: SNS topic for failure notifications (optional for test).
+  AuditBucket:
+    type: String
+    default: ''
+    description: S3 bucket for JSON audit reports (empty = skip S3 write).
+  CloudWatchNamespace:
+    type: String
+    default: 'DRSAutomation'
+    description: CloudWatch metric namespace for outcome metrics.
+  DrTagKey:
+    type: String
+    default: 'DR'
+    description: EC2 tag key that marks DR scope. Default 'DR'; override (e.g. 'DRAUTOMATIONTEST') for isolated testing so real DR-tagged instances are never touched.
+  DrProtectedValue:
+    type: String
+    default: 'yes'
+    description: Tag value that means "protected". Onboarding proceeds only when the DrTagKey value equals this (normalized, trim/lowercase).
+  AutomationAssumeRole:
+    type: String
+    default: ''
+    description: IAM role ARN for the Automation to assume.
+mainSteps:
+  - name: checkStandDown
+    action: aws:executeScript
+    description: >-
+      DR-event stand-down gate. Reads StandDownParameter from SSM Parameter
+      Store; if true, a DR event (failover/failback) is in progress and ALL
+      onboarding/remediation/alerting is paused so the automation does not fight
+      an in-flight DR operation (e.g., reverse replication). Absent/denied param
+      = not in stand-down (fail open to normal operation).
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        ParamName: '{{ StandDownParameter }}'
+      Script: |
+        import boto3
+        def handler(e, c):
+            name = e.get('ParamName') or '/drs/control/event-in-progress'
+            val = 'false'
+            try:
+                val = (boto3.client('ssm').get_parameter(Name=name)['Parameter']['Value'] or 'false').strip().lower()
+            except Exception:
+                val = 'false'
+            return {'StandDown': 'true' if val in ('true', '1', 'yes', 'on') else 'false'}
+    outputs:
+      - Name: StandDown
+        Selector: '$.Payload.StandDown'
+        Type: String
+    nextStep: branchStandDown
+
+  - name: branchStandDown
+    action: aws:branch
+    description: If a DR event is in progress, skip all action (audit-only record).
+    inputs:
+      Choices:
+        - NextStep: recordStandDown
+          Variable: '{{ checkStandDown.StandDown }}'
+          StringEquals: 'true'
+      Default: getInstanceState
+
+  - name: recordStandDown
+    action: aws:executeScript
+    description: DR event in progress — audit-only, no onboarding/remediation, no SNS alert.
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ InstanceId }}'
+        Event: 'ONBOARD'
+        Status: 'SKIPPED_DR_EVENT'
+        Detail: 'DR-event stand-down active ({{ StandDownParameter }}=true); onboarding/remediation paused. Will resume when the flag is cleared.'
+        SnsTopicArn: ''
+        Subject: '[DRS Onboarding] {{ InstanceId }}'
+        Message: ''
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,'sourceServerID':e.get('SourceServerID',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','SKIPPED_STOPPED','SKIPPED_DR_EVENT'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
+
+  - name: getInstanceState
+    action: aws:executeScript
+    description: >-
+      Read the EC2 instance state first. An intentionally stopped/terminated
+      instance cannot be onboarded; soft-skip it (no false-alarm) instead of
+      letting a Run Command failure raise a spurious onboarding alert.
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        InstanceId: '{{ InstanceId }}'
+      Script: |
+        import boto3
+        def handler(e, c):
+            ec2 = boto3.client('ec2'); iid = e['InstanceId']; state = 'not-found'
+            try:
+                r = ec2.describe_instances(InstanceIds=[iid])
+                resv = r.get('Reservations', [])
+                if resv and resv[0].get('Instances'):
+                    state = resv[0]['Instances'][0].get('State', {}).get('Name', 'unknown')
+            except Exception:
+                state = 'not-found'
+            return {'State': state}
+    outputs:
+      - Name: State
+        Selector: '$.Payload.State'
+        Type: String
+    nextStep: branchInstanceState
+
+  - name: branchInstanceState
+    action: aws:branch
+    description: Proceed only for a running instance; otherwise soft-skip (audit only, no alert).
+    inputs:
+      Choices:
+        - NextStep: readDrTag
+          Variable: '{{ getInstanceState.State }}'
+          StringEquals: running
+      Default: recordSkippedStopped
+
+  - name: recordSkippedStopped
+    action: aws:executeScript
+    description: Instance not running (stopped/terminated/pending) — audit-only soft skip, no SNS alert.
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ InstanceId }}'
+        Event: 'ONBOARD'
+        Status: 'SKIPPED_STOPPED'
+        Detail: 'Instance state is {{ getInstanceState.State }} (not running); onboarding skipped without alert. It will onboard automatically on the next run once running.'
+        SnsTopicArn: ''
+        Subject: '[DRS Onboarding] {{ InstanceId }}'
+        Message: ''
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,'sourceServerID':e.get('SourceServerID',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','SKIPPED_STOPPED'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
+
+  - name: readDrTag
+    action: aws:executeScript
+    description: Read the current DR tag value (defaults to 'absent', normalized). Onboarding proceeds only for DR=yes.
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        InstanceId: '{{ InstanceId }}'
+        DrTagKey: '{{ DrTagKey }}'
+        DrProtectedValue: '{{ DrProtectedValue }}'
+      Script: |
+        import boto3
+        def handler(e, c):
+            ec2=boto3.client('ec2'); iid=e['InstanceId']
+            key=(e.get('DrTagKey') or 'DR').strip()
+            protected=(e.get('DrProtectedValue') or 'yes').strip().lower()
+            dr='absent'
+            try:
+                r=ec2.describe_instances(InstanceIds=[iid]); resv=r.get('Reservations',[])
+                if resv and resv[0].get('Instances'):
+                    for t in resv[0]['Instances'][0].get('Tags',[]):
+                        if t.get('Key')==key:
+                            dr=(t.get('Value') or 'absent').strip().lower(); break
+            except Exception:
+                pass
+            return {'DrValue': dr, 'Protected': 'true' if dr==protected else 'false'}
+    outputs:
+      - Name: DrValue
+        Selector: '$.Payload.DrValue'
+        Type: String
+      - Name: Protected
+        Selector: '$.Payload.Protected'
+        Type: String
+    nextStep: branchDrProtected
+
+  - name: branchDrProtected
+    action: aws:branch
+    description: Onboard only when the DR tag value equals DrProtectedValue (normalized); any other value (pause/no/absent/unexpected) is skipped (audit-only, no install, no alert).
+    inputs:
+      Choices:
+        - NextStep: getPlatform
+          Variable: '{{ readDrTag.Protected }}'
+          StringEquals: 'true'
+      Default: recordSkippedNotProtected
+
+  - name: recordSkippedNotProtected
+    action: aws:executeScript
+    description: DR tag value is not 'yes' — audit-only soft skip, no install, no SNS alert.
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ InstanceId }}'
+        Event: 'ONBOARD'
+        Status: 'SKIPPED_NOT_PROTECTED'
+        Detail: "DR tag value is '{{ readDrTag.DrValue }}' (not 'yes'); onboarding skipped without alert. It will onboard automatically once DR=yes."
+        SnsTopicArn: ''
+        Subject: '[DRS Onboarding] {{ InstanceId }}'
+        Message: ''
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,'sourceServerID':e.get('SourceServerID',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','SKIPPED_STOPPED','SKIPPED_NOT_PROTECTED'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
+
+  - name: getPlatform
+    action: aws:executeAwsApi
+    description: Resolve the instance platform (Linux/Windows) from SSM inventory.
+    inputs:
+      Service: ssm
+      Api: DescribeInstanceInformation
+      Filters:
+        - Key: InstanceIds
+          Values:
+            - '{{ InstanceId }}'
+    outputs:
+      - Name: PlatformType
+        Selector: '$.InstanceInformationList[0].PlatformType'
+        Type: String
+    nextStep: choosePlatform
+
+  - name: choosePlatform
+    action: aws:branch
+    description: Route by platform; alert if the instance is not SSM-managed or reports an unsupported platform.
+    inputs:
+      Choices:
+        - NextStep: onboardLinux
+          Variable: '{{ getPlatform.PlatformType }}'
+          StringEquals: Linux
+        - NextStep: onboardWindows
+          Variable: '{{ getPlatform.PlatformType }}'
+          StringEquals: Windows
+      Default: notifyNotManaged
+
+  - name: notifyNotManaged
+    action: aws:executeScript
+    description: >-
+      DR=yes but the instance is not SSM-managed (no SSM agent / IAM / network
+      path) or reports an unsupported platform — it cannot be onboarded and was
+      previously a SILENT gap. Alert + audit so the protection gap is visible.
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ InstanceId }}'
+        Event: 'ONBOARD'
+        Status: 'NOT_MANAGED'
+        Detail: 'DR=yes but not SSM-managed or unsupported platform (PlatformType=[{{ getPlatform.PlatformType }}]). Cannot onboard.'
+        SnsTopicArn: '{{ SnsTopicArn }}'
+        Subject: '[DRS Onboarding - NOT MANAGED] {{ InstanceId }}'
+        Message: 'Instance {{ InstanceId }} is tagged DR=yes but is NOT SSM-managed (SSM agent down, missing IAM, or no SSM network path) or reports an unsupported platform (PlatformType=[{{ getPlatform.PlatformType }}]). It cannot be onboarded and is UNPROTECTED. Verify the SSM agent, instance profile, and connectivity.'
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,'sourceServerID':e.get('SourceServerID',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','SKIPPED_STOPPED'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
+
+  - name: onboardLinux
+    action: aws:runCommand
+    description: Supported-platform + pre-req checks, hostname preserve, health, install (if enabled), validate (Linux).
+    onFailure: 'step:notifyFailure'
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      Parameters:
+        executionTimeout: '3600'
+        commands:
+          - '#!/bin/bash'
+          - 'set -uo pipefail'
+          - '# ---- Concurrency guard: ensure only one onboarding run touches this instance at a time ----'
+          - 'exec 9>/var/lock/drs-onboard.lock 2>/dev/null || exec 9>/tmp/drs-onboard.lock'
+          - 'if command -v flock >/dev/null 2>&1 && ! flock -n 9; then echo "[RESULT] SKIPPED_LOCKED - another onboarding run is in progress"; exit 0; fi'
+          - 'TARGET_REGION="{{ TargetRegion }}"'
+          - 'AUTO_INSTALL="{{ AutoInstallEnabled }}"'
+          - 'FAIL=0'
+          - 'TMP_WAS_NOEXEC=false'
+          - '# Restore /tmp noexec on ANY exit path (fixes leaving /tmp exec on early-exit/skip paths)'
+          - 'restore_tmp(){ if [ "$TMP_WAS_NOEXEC" = "true" ]; then mount -o remount,noexec /tmp 2>/dev/null || true; fi; }'
+          - 'trap restore_tmp EXIT'
+          - 'S3_HOST="aws-elastic-disaster-recovery-${TARGET_REGION}.s3.${TARGET_REGION}.amazonaws.com"'
+          - '# ---- Supported-platform pre-check (proactive classification instead of an opaque late installer failure) ----'
+          - 'ARCH=$(uname -m 2>/dev/null || echo unknown)'
+          - 'if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then echo "[ERROR] TAGGED_UNSUPPORTED: CPU arch $ARCH is not supported by AWS DRS"; echo "[RESULT] TAGGED_UNSUPPORTED"; exit 1; fi'
+          - 'if ! command -v systemctl >/dev/null 2>&1; then echo "[ERROR] TAGGED_UNSUPPORTED: systemd/systemctl not present (container or unsupported init); the DRS agent requires systemd"; echo "[RESULT] TAGGED_UNSUPPORTED"; exit 1; fi'
+          - '# ---- Idempotency: already running? ----'
+          - 'if systemctl is-active --quiet aws-replication-agent 2>/dev/null; then echo "[INFO] Agent already running."; AGENT_OK=true; else AGENT_OK=false; fi'
+          - '# ---- Agent PRESENCE (installed, any status) — drives failback tagging in the control plane ----'
+          - 'if systemctl list-unit-files 2>/dev/null | grep -q aws-replication-agent || [ -d /var/lib/aws-replication-agent ]; then AGENT_PRESENT=true; else AGENT_PRESENT=false; fi'
+          - '# ---- Pre-req checks ----'
+          - 'command -v python3 >/dev/null || { echo "[ERROR] python3 missing"; FAIL=1; }'
+          - 'PYV=$(python3 -c "import sys;print(sys.version_info[0]*10+sys.version_info[1])" 2>/dev/null || echo 0)'
+          - 'if [ "${PYV:-0}" -lt 36 ]; then echo "[WARN] python3 older than 3.6 detected (code=$PYV); the DRS installer may be unsupported on this version"; fi'
+          - 'command -v wget >/dev/null || command -v curl >/dev/null || { echo "[ERROR] neither wget nor curl present"; FAIL=1; }'
+          - 'ROOT_FREE_GB=$(df -BG / | awk "NR==2{gsub(/G/,\"\",\$4); print \$4}")'
+          - 'if [ "${ROOT_FREE_GB:-0}" -lt 4 ]; then echo "[ERROR] root free <4GB ($ROOT_FREE_GB)"; FAIL=1; fi'
+          - 'RAM_FREE_MB=$(free -m | awk "/^Mem:/{print \$7}")'
+          - 'if [ "${RAM_FREE_MB:-0}" -lt 300 ]; then echo "[WARN] low free RAM ($RAM_FREE_MB MB)"; fi'
+          - 'if [ -n "${HTTPS_PROXY:-}${https_proxy:-}" ]; then echo "[INFO] HTTPS proxy present in environment (${HTTPS_PROXY:-$https_proxy}); wget/curl and the installer will honor it"; fi'
+          - 'if command -v getenforce >/dev/null 2>&1; then SE=$(getenforce 2>/dev/null || echo unknown); if [ "$SE" = "Enforcing" ]; then echo "[INFO] SELinux is Enforcing (supported by DRS) - logging for awareness"; fi; fi'
+          - 'TMP_WAS_NOEXEC=false'
+          - 'if mount | grep -q "/tmp.*noexec"; then mount -o remount,exec /tmp && TMP_WAS_NOEXEC=true; fi'
+          - 'if mount | grep -q "on /tmp type tmpfs"; then mount -o remount,size=2G /tmp 2>/dev/null || true; fi'
+          - 'getent hosts "drs.${TARGET_REGION}.amazonaws.com" >/dev/null 2>&1 || { echo "[ERROR] DRS DNS unresolved (check PHZ / VPC endpoint)"; FAIL=1; }'
+          - 'getent hosts "$S3_HOST" >/dev/null 2>&1 || { echo "[ERROR] S3 DNS unresolved"; FAIL=1; }'
+          - 'if [ "$FAIL" -ne 0 ]; then echo "[RESULT] PreReqCheck FAILED"; exit 1; fi'
+          - 'echo "[INFO] Pre-req checks passed."'
+          - '# ---- Hostname preservation: lock /etc/hostname with the immutable attribute (chattr +i) ----'
+          - '# The persistent hostname must not change (DRS failback and app/licensing identity depend on it).'
+          - '# The existing file content is preserved as-is (never rewritten/truncated); the file is only'
+          - '# seeded if empty. Idempotent: a re-run detects the flag and no-ops. Never fails onboarding.'
+          - 'HN_LOCKED=false'
+          - 'HN_SKIP=false'
+          - 'if [ -L /etc/hostname ]; then echo "[WARN] /etc/hostname is a symlink -> $(readlink -f /etc/hostname 2>/dev/null); skipping immutable lock (would lock the link, not the target)"; HN_SKIP=true; fi'
+          - 'if [ "$HN_SKIP" = "false" ] && ! command -v chattr >/dev/null 2>&1; then echo "[WARN] chattr not available; cannot lock /etc/hostname"; HN_SKIP=true; fi'
+          - 'if [ "$HN_SKIP" = "false" ] && lsattr /etc/hostname 2>/dev/null | cut -d" " -f1 | grep -q i; then echo "[INFO] /etc/hostname is already immutable (no change)"; HN_LOCKED=true; HN_SKIP=true; fi'
+          - 'if [ "$HN_SKIP" = "false" ]; then HN_FS=$(findmnt -no FSTYPE -T /etc/hostname 2>/dev/null || echo unknown); case "$HN_FS" in ext2|ext3|ext4|xfs|btrfs) : ;; *) echo "[WARN] filesystem $HN_FS may not support the immutable attribute" ;; esac; fi'
+          - 'if [ "$HN_SKIP" = "false" ] && [ ! -s /etc/hostname ]; then if hostname > /etc/hostname 2>/dev/null; then echo "[INFO] seeded empty /etc/hostname with $(hostname)"; else echo "[WARN] could not seed empty /etc/hostname"; fi; fi'
+          - 'if [ "$HN_SKIP" = "false" ]; then if chattr +i /etc/hostname 2>/dev/null; then HN_LOCKED=true; echo "[INFO] /etc/hostname is now immutable"; else echo "[WARN] failed to set the immutable flag on /etc/hostname"; fi; fi'
+          - 'CUR_HN=$(cat /etc/hostname 2>/dev/null || hostname)'
+          - 'echo "[INFO] Hostname preserved: $CUR_HN (immutable=$HN_LOCKED)"'
+          - '# ---- Health/idempotency gate (tagging happens in the Automation control plane, next step) ----'
+          - 'if [ "$AGENT_OK" = "true" ]; then echo "[RESULT] SKIPPED_HEALTHY"; echo "AGENT_PRESENT=true"; exit 0; fi'
+          - 'if [ "$AUTO_INSTALL" != "true" ]; then echo "[RESULT] AUDIT_NOACTION - AutoInstall disabled (agent present=$AGENT_PRESENT)"; echo "AGENT_PRESENT=$AGENT_PRESENT"; exit 0; fi'
+          - '# ---- Repair first: if a service unit exists but is stopped, try starting it before any reinstall (avoids needless resync) ----'
+          - 'if systemctl list-unit-files 2>/dev/null | grep -q aws-replication-agent; then systemctl start aws-replication-agent 2>/dev/null || true; sleep 3; if systemctl is-active --quiet aws-replication-agent; then echo "[RESULT] REPAIRED_RESTARTED"; echo "AGENT_PRESENT=true"; exit 0; fi; fi'
+          - '# ---- Clean stale installer processes / partial-install state before (re)install (prevents "Text file busy" + corrupt retries) ----'
+          - 'pkill -f aws-replication-installer 2>/dev/null || true; sleep 2'
+          - 'rm -f /tmp/aws-replication-installer-64bit /tmp/aws-replication-installer-init.py'
+          - 'if [ -d /var/lib/aws-replication-agent ] && ! systemctl is-active --quiet aws-replication-agent; then echo "[INFO] Removing partial/failed agent install before reinstall"; rm -rf /var/lib/aws-replication-agent; fi'
+          - '# ---- Install ----'
+          - 'cd /tmp'
+          - 'DL_URL="https://${S3_HOST}/latest/linux/aws-replication-installer-init.py"'
+          - '# Download with wget if present, else fall back to curl (pre-req accepts either)'
+          - 'if command -v wget >/dev/null 2>&1; then wget -q -O ./aws-replication-installer-init.py "$DL_URL"; elif command -v curl >/dev/null 2>&1; then curl -fsSL -o ./aws-replication-installer-init.py "$DL_URL"; fi'
+          - 'if [ ! -s ./aws-replication-installer-init.py ]; then echo "[ERROR] installer download failed (wget/curl)"; exit 1; fi'
+          - '# DRS connectivity relies on private DNS (PHZ) resolving the standard drs.<region>.amazonaws.com and S3 endpoints to the interface endpoints.'
+          - '# Per AWS docs, --endpoint is NOT recommended on EC2 (failback risk). No installer endpoint flags are passed; private connectivity comes from DNS (validated by the POC).'
+          - 'python3 /tmp/aws-replication-installer-init.py --region "$TARGET_REGION" --no-prompt || { echo "[ERROR] installer failed"; exit 1; }'
+          - 'sleep 5'
+          - 'systemctl is-active --quiet aws-replication-agent || { echo "[ERROR] agent not active post-install"; exit 1; }'
+          - 'systemctl enable aws-replication-agent 2>/dev/null || true'
+          - 'if systemctl cat aws-replication-agent >/dev/null 2>&1; then mkdir -p /etc/systemd/system/aws-replication-agent.service.d; printf "[Service]\nRestart=always\nRestartSec=10\n" > /etc/systemd/system/aws-replication-agent.service.d/restart.conf; systemctl daemon-reload; fi'
+          - 'echo "[RESULT] SUCCESS - agent installed, hostname preserved (tagging handled by Automation)"'
+          - 'echo "AGENT_PRESENT=true"'
+    nextStep: evalPresenceLinux
+
+  - name: onboardWindows
+    action: aws:runCommand
+    description: Supported-platform + pre-req checks, hostname check, health, install (if enabled), validate (Windows).
+    onFailure: 'step:notifyFailure'
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      Parameters:
+        executionTimeout: '3600'
+        commands:
+          - '$ErrorActionPreference = "Stop"'
+          - '$TargetRegion = "{{ TargetRegion }}"'
+          - '$AutoInstall = "{{ AutoInstallEnabled }}"'
+          - '$S3Host = "aws-elastic-disaster-recovery-$TargetRegion.s3.$TargetRegion.amazonaws.com"'
+          - '# Concurrency guard: a named mutex ensures only one onboarding run touches this instance at a time'
+          - '$mtx = New-Object System.Threading.Mutex($false, "Global\DRSOnboard")'
+          - 'try { $acquired = $mtx.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $acquired = $true }'
+          - 'if (-not $acquired) { Write-Output "[RESULT] SKIPPED_LOCKED - another onboarding run is in progress"; exit 0 }'
+          - 'try {'
+          - '  # ---- Supported-platform pre-check (proactive classification) ----'
+          - '  if (-not [Environment]::Is64BitOperatingSystem) { Write-Output "[ERROR] TAGGED_UNSUPPORTED: 32-bit Windows is not supported by AWS DRS"; Write-Output "[RESULT] TAGGED_UNSUPPORTED"; exit 1 }'
+          - '  $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue'
+          - '  if ($os -and ([version]$os.Version -lt [version]"6.3")) { Write-Output "[ERROR] TAGGED_UNSUPPORTED: Windows $($os.Version) is older than Server 2012 R2; not supported by AWS DRS"; Write-Output "[RESULT] TAGGED_UNSUPPORTED"; exit 1 }'
+          - '  if ($env:HTTPS_PROXY) { Write-Output "[INFO] HTTPS proxy detected in environment: $($env:HTTPS_PROXY)" }'
+          - '  $svc = Get-Service -Name "AwsReplicationService" -ErrorAction SilentlyContinue'
+          - '  $agentOk = ($svc -and $svc.Status -eq "Running")'
+          - '  # ---- Agent PRESENCE (installed, any status) — drives failback tagging in the control plane ----'
+          - '  $agentPresent = if ($svc -or (Test-Path "C:\Program Files (x86)\AWS Replication Agent")) { "true" } else { "false" }'
+          - '  # Pre-req: .NET 4.5+'
+          - '  $rel = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" -ErrorAction SilentlyContinue).Release'
+          - '  if (-not $rel -or $rel -lt 378389) { Write-Output "[ERROR] .NET 4.5+ not found"; Write-Output "[RESULT] PreReqCheck FAILED"; exit 1 }'
+          - '  $freeGB = [math]::Round((Get-PSDrive C).Free/1GB,1)'
+          - '  if ($freeGB -lt 2) { Write-Output "[ERROR] C: free <2GB ($freeGB)"; Write-Output "[RESULT] PreReqCheck FAILED"; exit 1 }'
+          - '  if (-not (Resolve-DnsName $S3Host -ErrorAction SilentlyContinue)) { Write-Output "[ERROR] S3 DNS unresolved"; Write-Output "[RESULT] PreReqCheck FAILED"; exit 1 }'
+          - '  if (-not (Resolve-DnsName "drs.$TargetRegion.amazonaws.com" -ErrorAction SilentlyContinue)) { Write-Output "[ERROR] DRS DNS unresolved (check PHZ / VPC endpoint)"; Write-Output "[RESULT] PreReqCheck FAILED"; exit 1 }'
+          - '  Write-Output "[INFO] Pre-req checks passed."'
+          - '  # Hostname preservation: ensure EC2Launch v2 setComputerName not present'
+          - '  $cfg = "C:\ProgramData\Amazon\EC2Launch\config\agent-config.yml"'
+          - '  if (Test-Path $cfg) { $c = Get-Content $cfg -Raw; if ($c -match "setComputerName") { ($c -replace ".*setComputerName.*\r?\n","") | Set-Content $cfg; Write-Output "[INFO] removed setComputerName" } }'
+          - '  if ($agentOk) { Write-Output "[RESULT] SKIPPED_HEALTHY"; Write-Output "AGENT_PRESENT=true"; exit 0 }'
+          - '  if ($AutoInstall -ne "true") { Write-Output "[RESULT] AUDIT_NOACTION - AutoInstall disabled (agent present=$agentPresent)"; Write-Output "AGENT_PRESENT=$agentPresent"; exit 0 }'
+          - '  # Repair first: if the service exists but is stopped, try starting it before any reinstall (avoids needless resync)'
+          - '  if ($svc) { try { Start-Service -Name "AwsReplicationService" -ErrorAction SilentlyContinue; Start-Sleep -Seconds 3; $svc = Get-Service -Name "AwsReplicationService" -ErrorAction SilentlyContinue; if ($svc -and $svc.Status -eq "Running") { Write-Output "[RESULT] REPAIRED_RESTARTED"; Write-Output "AGENT_PRESENT=true"; exit 0 } } catch {} }'
+          - '  # Clean stale installer processes / partial-install state before (re)install (prevents corrupt retries that surface as "connection failed")'
+          - '  Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "AwsReplication|replication-installer" } | Stop-Process -Force -ErrorAction SilentlyContinue'
+          - '  $agentDir = "C:\Program Files (x86)\AWS Replication Agent"'
+          - '  if ((Test-Path $agentDir) -and (-not ($svc -and $svc.Status -eq "Running"))) { Write-Output "[INFO] Removing partial/failed agent install before reinstall"; Remove-Item -Path $agentDir -Recurse -Force -ErrorAction SilentlyContinue }'
+          - '  # Install'
+          - '  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12'
+          - '  $url = "https://$S3Host/latest/windows/AwsReplicationWindowsInstaller.exe"'
+          - '  $path = "$env:TEMP\AwsReplicationWindowsInstaller.exe"'
+          - '  Invoke-WebRequest -Uri $url -OutFile $path -UseBasicParsing'
+          - '  # DRS connectivity relies on private DNS (PHZ) resolving the standard drs.<region>.amazonaws.com and S3 endpoints. --endpoint is NOT recommended on EC2 (failback risk); no installer endpoint flags are passed.'
+          - '  Start-Process -FilePath $path -ArgumentList "--region $TargetRegion --no-prompt" -Wait -NoNewWindow'
+          - '  Start-Sleep -Seconds 10'
+          - '  $svc = Get-Service -Name "AwsReplicationService" -ErrorAction SilentlyContinue'
+          - '  if (-not $svc -or $svc.Status -ne "Running") { Write-Output "[ERROR] agent not running post-install"; exit 1 }'
+          - '  foreach ($s in @("AwsReplicationService","AwsReplicationDriverLogger","AwsReplicationLogger","AwsReplicationVolumeUpdaterService")) { if (Get-Service -Name $s -ErrorAction SilentlyContinue) { Set-Service -Name $s -StartupType Automatic } }'
+          - '  sc.exe failure AwsReplicationService reset=86400 actions=restart/10000/restart/10000/restart/10000 | Out-Null'
+          - '  Write-Output "[RESULT] SUCCESS - agent installed, hostname preserved (tagging handled by Automation)"'
+          - '  Write-Output "AGENT_PRESENT=true"'
+          - '} catch { Write-Output "[ERROR] $($_.Exception.Message)"; exit 1 }'
+    nextStep: evalPresenceWindows
+
+  - name: evalPresenceLinux
+    action: aws:executeScript
+    description: Parse the Linux onboard output for the agent-presence marker; drives whether the failback tag is applied.
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Out: '{{ onboardLinux.Output }}'
+      Script: |
+        def handler(e, c):
+            out = e.get('Out') or ''
+            return {'AgentPresent': 'true' if 'AGENT_PRESENT=true' in out else 'false'}
+    outputs:
+      - Name: AgentPresent
+        Selector: '$.Payload.AgentPresent'
+        Type: String
+    nextStep: branchTagLinux
+
+  - name: branchTagLinux
+    action: aws:branch
+    description: Attach the failback tag only when the DRS agent is present (installed, any status); otherwise skip tagging.
+    inputs:
+      Choices:
+        - NextStep: tagInstance
+          Variable: '{{ evalPresenceLinux.AgentPresent }}'
+          StringEquals: 'true'
+      Default: assessRegistration
+
+  - name: evalPresenceWindows
+    action: aws:executeScript
+    description: Parse the Windows onboard output for the agent-presence marker; drives whether the failback tag is applied.
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Out: '{{ onboardWindows.Output }}'
+      Script: |
+        def handler(e, c):
+            out = e.get('Out') or ''
+            return {'AgentPresent': 'true' if 'AGENT_PRESENT=true' in out else 'false'}
+    outputs:
+      - Name: AgentPresent
+        Selector: '$.Payload.AgentPresent'
+        Type: String
+    nextStep: branchTagWindows
+
+  - name: branchTagWindows
+    action: aws:branch
+    description: Attach the failback tag only when the DRS agent is present (installed, any status); otherwise skip tagging.
+    inputs:
+      Choices:
+        - NextStep: tagInstance
+          Variable: '{{ evalPresenceWindows.AgentPresent }}'
+          StringEquals: 'true'
+      Default: assessRegistration
+
+  - name: tagInstance
+    action: aws:executeAwsApi
+    description: >-
+      Apply the failback tag in the Automation control plane (uses the
+      AutomationAssumeRole, not the instance profile). Reached only when the DRS
+      agent is PRESENT on the instance (branchTag* gate). Idempotent — CreateTags
+      adds the tag if missing and is a no-op if already present, so it also
+      corrects drift where an agent-present instance lost its failback tag.
+    inputs:
+      Service: ec2
+      Api: CreateTags
+      Resources:
+        - '{{ InstanceId }}'
+      Tags:
+        - Key: AWSDRS
+          Value: AllowLaunchingIntoThisInstance
+    nextStep: assessRegistration
+
+  - name: assessRegistration
+    action: aws:executeScript
+    description: >-
+      Control-plane, registration-aware health check. Confirms the instance is
+      registered as a source server in TargetRegion (match on awsInstanceID),
+      reports replication state, and detects reverse/failback registration via
+      the source server's replicationDirection field (FAILBACK). Polls up to
+      AgentRegistrationTimeout for a fresh install to register. Uses the
+      AutomationAssumeRole's drs:DescribeSourceServers.
+    timeoutSeconds: 1200
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        InstanceId: '{{ InstanceId }}'
+        TargetRegion: '{{ TargetRegion }}'
+        TimeoutMinutes: '{{ AgentRegistrationTimeout }}'
+      Script: |
+        import boto3, time
+        def find(region, iid):
+            drs = boto3.client('drs', region_name=region)
+            for page in drs.get_paginator('describe_source_servers').paginate(filters={}):
+                for s in page.get('items', []):
+                    hints = s.get('sourceProperties', {}).get('identificationHints', {})
+                    if hints.get('awsInstanceID') == iid:
+                        return s
+            return None
+        def handler(event, context):
+            iid = event['InstanceId']
+            target = event['TargetRegion']
+            try:
+                timeout_min = float(event.get('TimeoutMinutes', '15'))
+            except Exception:
+                timeout_min = 15.0
+            # Bounded poll (cap at ~18 min to stay within step timeout)
+            deadline = time.time() + min(timeout_min, 18) * 60
+            srv = None
+            while time.time() < deadline:
+                srv = find(target, iid)
+                if srv:
+                    break
+                time.sleep(30)
+            if not srv:
+                return {'Status': 'PENDING_REGISTRATION',
+                        'SourceServerID': '',
+                        'ReplicationState': 'NONE',
+                        'Detail': 'No source server registered in TargetRegion yet (expected immediately after a fresh install or in audit mode).'}
+            ssid = srv['sourceServerID']
+            state = srv.get('dataReplicationInfo', {}).get('dataReplicationState', 'UNKNOWN')
+            # Reverse/failback detection: DRS sets replicationDirection=FAILBACK when
+            # replication runs from a recovery instance back to origin (post-failover
+            # failback). For a forward-protection onboarding this is a mis-registration
+            # / DR operation in progress — flag it and do NOT treat as a normal install.
+            direction = srv.get('replicationDirection', 'FAILOVER') or 'FAILOVER'
+            if direction == 'FAILBACK':
+                status = 'REVERSE_REPLICATION'
+            elif state in ('STALLED', 'DISCONNECTED'):
+                status = 'UNHEALTHY'
+            elif state in ('INITIAL_SYNC', 'RESCAN', 'CREATING_SNAPSHOT'):
+                status = 'IN_PROGRESS'
+            else:
+                status = 'HEALTHY'
+            return {'Status': status,
+                    'SourceServerID': ssid,
+                    'ReplicationState': state,
+                    'Detail': 'Registered in %s as %s, state=%s, direction=%s' % (target, ssid, state, direction)}
+    outputs:
+      - Name: Status
+        Selector: '$.Payload.Status'
+        Type: String
+      - Name: SourceServerID
+        Selector: '$.Payload.SourceServerID'
+        Type: String
+      - Name: ReplicationState
+        Selector: '$.Payload.ReplicationState'
+        Type: String
+    nextStep: trackPending
+
+  - name: trackPending
+    action: aws:executeScript
+    description: >-
+      Persist a per-instance consecutive PENDING_REGISTRATION counter in SSM
+      Parameter Store (/drs/pending/<instanceId>). Clears it on any registered
+      state; escalates once the count reaches PendingEscalationThreshold. This
+      catches a box whose agent is "running locally but never registered"
+      (SKIPPED_HEALTHY still flows here) and a persistently-pending instance
+      (DRS not initialized in TargetRegion, control-plane connectivity blocked).
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        InstanceId: '{{ InstanceId }}'
+        Status: '{{ assessRegistration.Status }}'
+        Threshold: '{{ PendingEscalationThreshold }}'
+      Script: |
+        import boto3
+        def handler(e, c):
+            ssm = boto3.client('ssm')
+            iid = e['InstanceId']; status = e.get('Status', '')
+            try:
+                thr = int(e.get('Threshold', '3'))
+            except Exception:
+                thr = 3
+            name = '/drs/pending/%s' % iid
+            # Any registered state clears the counter.
+            if status in ('HEALTHY', 'IN_PROGRESS', 'UNHEALTHY', 'REVERSE_REPLICATION'):
+                try:
+                    ssm.delete_parameter(Name=name)
+                except Exception:
+                    pass
+                return {'PendingCount': 0, 'Escalate': 'false'}
+            # PENDING_REGISTRATION (or anything not registered) -> increment.
+            cur = 0
+            try:
+                cur = int(ssm.get_parameter(Name=name)['Parameter']['Value'])
+            except Exception:
+                cur = 0
+            cur += 1
+            try:
+                ssm.put_parameter(Name=name, Value=str(cur), Type='String', Overwrite=True)
+            except Exception:
+                pass
+            return {'PendingCount': cur, 'Escalate': ('true' if cur >= thr else 'false')}
+    outputs:
+      - Name: PendingCount
+        Selector: '$.Payload.PendingCount'
+        Type: Integer
+      - Name: Escalate
+        Selector: '$.Payload.Escalate'
+        Type: String
+    nextStep: reportOnboard
+
+  - name: reportOnboard
+    action: aws:executeScript
+    description: Write S3 audit report + emit CloudWatch metric for the onboarding outcome (no SNS on success — failure/issue steps handle alerts).
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ InstanceId }}'
+        Event: 'ONBOARD'
+        Status: '{{ assessRegistration.Status }}'
+        SourceServerID: '{{ assessRegistration.SourceServerID }}'
+        Detail: '{{ assessRegistration.ReplicationState }}'
+        SnsTopicArn: ''
+        Subject: '[DRS Onboarding] {{ InstanceId }}'
+        Message: ''
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,'sourceServerID':e.get('SourceServerID',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','SKIPPED_STOPPED'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    nextStep: branchOutcome
+
+  - name: branchOutcome
+    action: aws:branch
+    description: Alert on unhealthy replication, reverse/failback registration, or persistent PENDING; otherwise end.
+    inputs:
+      Choices:
+        - NextStep: notifyRegistrationIssue
+          Variable: '{{ assessRegistration.Status }}'
+          StringEquals: UNHEALTHY
+        - NextStep: notifyReverseDirection
+          Variable: '{{ assessRegistration.Status }}'
+          StringEquals: REVERSE_REPLICATION
+        - NextStep: notifyPendingEscalation
+          Variable: '{{ trackPending.Escalate }}'
+          StringEquals: 'true'
+    isEnd: true
+
+  - name: notifyRegistrationIssue
+    action: aws:executeScript
+    description: Notify (SNS) + S3 audit + metric — registered but replication unhealthy.
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ InstanceId }}'
+        Event: 'ONBOARD'
+        Status: 'UNHEALTHY'
+        SourceServerID: '{{ assessRegistration.SourceServerID }}'
+        Detail: '{{ assessRegistration.ReplicationState }}'
+        SnsTopicArn: '{{ SnsTopicArn }}'
+        Subject: '[DRS Onboarding - replication unhealthy] {{ InstanceId }}'
+        Message: 'Instance {{ InstanceId }} source server {{ assessRegistration.SourceServerID }} is registered in {{ TargetRegion }} but replication state is {{ assessRegistration.ReplicationState }}. Investigate connectivity / agent health.'
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,'sourceServerID':e.get('SourceServerID',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','SKIPPED_STOPPED'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
+
+  - name: notifyReverseDirection
+    action: aws:executeScript
+    description: Notify (SNS) + S3 audit + metric — source server is in reverse/failback direction (post-failover failback or mis-registration). No reinstall performed.
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ InstanceId }}'
+        Event: 'ONBOARD'
+        Status: 'REVERSE_REPLICATION'
+        SourceServerID: '{{ assessRegistration.SourceServerID }}'
+        Detail: '{{ assessRegistration.ReplicationState }}'
+        SnsTopicArn: '{{ SnsTopicArn }}'
+        Subject: '[DRS Onboarding - reverse/failback direction] {{ InstanceId }}'
+        Message: 'Instance {{ InstanceId }} source server {{ assessRegistration.SourceServerID }} in {{ TargetRegion }} has replicationDirection=FAILBACK (reverse/post-failover failback). Onboarding made NO changes (no reinstall). This indicates a failback/DR operation in progress or a mis-registration; review before re-protecting forward.'
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,'sourceServerID':e.get('SourceServerID',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','SKIPPED_STOPPED'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
+
+  - name: notifyPendingEscalation
+    action: aws:executeScript
+    description: Notify (SNS) + S3 audit + metric — instance has been PENDING_REGISTRATION for >= threshold consecutive runs (agent up but not registered, or persistently unable to register).
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ InstanceId }}'
+        Event: 'ONBOARD'
+        Status: 'PENDING_ESCALATED'
+        SourceServerID: ''
+        Detail: 'PENDING_REGISTRATION for {{ trackPending.PendingCount }} consecutive runs (threshold {{ PendingEscalationThreshold }}).'
+        SnsTopicArn: '{{ SnsTopicArn }}'
+        Subject: '[DRS Onboarding - not registering] {{ InstanceId }}'
+        Message: 'Instance {{ InstanceId }} (DR=yes) has been PENDING_REGISTRATION for {{ trackPending.PendingCount }} consecutive runs (threshold {{ PendingEscalationThreshold }}). The agent may be installed but is not registered/replicating in {{ TargetRegion }} - likely causes: DRS not initialized in the DR region, control-plane (443) connectivity blocked, or registration failing. The instance is tagged for protection but is currently UNPROTECTED - investigate.'
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,'sourceServerID':e.get('SourceServerID',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','SKIPPED_STOPPED'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
+
+  - name: notifyFailure
+    action: aws:executeScript
+    description: Notify (SNS) + S3 audit + metric on onboarding failure (includes TAGGED_UNSUPPORTED, pre-req, download, and install failures — see the Run Command output for the [RESULT]/[ERROR] marker).
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ InstanceId }}'
+        Event: 'ONBOARD'
+        Status: 'FAILED'
+        SourceServerID: ''
+        Detail: 'Onboarding failed; check the SSM Automation / Run Command output for the failing step. A [RESULT] TAGGED_UNSUPPORTED marker means the OS/arch is not supported by DRS.'
+        SnsTopicArn: '{{ SnsTopicArn }}'
+        Subject: '[DRS Onboarding FAILED] {{ InstanceId }}'
+        Message: 'DRS onboarding failed on {{ InstanceId }} (region {{ TargetRegion }}). Check the SSM Automation / Run Command output for the failing step. If the output shows [RESULT] TAGGED_UNSUPPORTED, the instance OS/architecture is not supported by AWS DRS.'
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,'sourceServerID':e.get('SourceServerID',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','SKIPPED_STOPPED'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
