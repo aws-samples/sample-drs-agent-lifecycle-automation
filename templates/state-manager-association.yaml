@@ -1,0 +1,112 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  State Manager association for DRS Agent Lifecycle Automation.
+  Targets all EC2 instances tagged DR=yes and runs the onboarding automation
+  on a scheduled cadence (default: every 30 minutes).
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  AutomationRoleArn:
+    Type: String
+    Description: ARN of the DRS-Automation-Role
+
+  OnboardDocumentName:
+    Type: String
+    Description: Name of the onboard SSM Automation document
+    Default: DRS-Agent-Onboard
+
+  TargetRegion:
+    Type: String
+    Description: DR region where DRS replicates to
+    Default: us-east-2
+
+  ScheduleRate:
+    Type: String
+    Description: How often State Manager runs the onboarding check
+    Default: rate(30 minutes)
+
+  AutoInstallEnabled:
+    Type: String
+    Description: Whether to auto-install the agent (true) or audit-only (false)
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+
+  DrTagKey:
+    Type: String
+    Description: EC2 tag key that controls DR lifecycle
+    Default: DR
+
+  DrProtectedValue:
+    Type: String
+    Description: Tag value that means instance is protected
+    Default: 'yes'
+
+  SNSTopicArn:
+    Type: String
+    Description: SNS topic ARN for notifications (optional)
+    Default: ''
+
+  AuditBucket:
+    Type: String
+    Description: S3 bucket for audit logs (optional)
+    Default: ''
+
+  StandDownParameter:
+    Type: String
+    Description: SSM parameter name for DR-event stand-down
+    Default: /drs/control/event-in-progress
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  DRSOnboardAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: !Ref OnboardDocumentName
+      AssociationName: DRS-Agent-Onboard-Association
+      # Target all instances tagged with DR=yes
+      Targets:
+        - Key: !Sub 'tag:${DrTagKey}'
+          Values:
+            - !Ref DrProtectedValue
+      # Run on schedule
+      ScheduleExpression: !Ref ScheduleRate
+      # SSM Automation parameters
+      Parameters:
+        TargetRegion:
+          - !Ref TargetRegion
+        AutoInstallEnabled:
+          - !Ref AutoInstallEnabled
+        SnsTopicArn:
+          - !Ref SNSTopicArn
+        AuditBucket:
+          - !Ref AuditBucket
+        StandDownParameter:
+          - !Ref StandDownParameter
+        DrTagKey:
+          - !Ref DrTagKey
+        DrProtectedValue:
+          - !Ref DrProtectedValue
+        AutomationAssumeRole:
+          - !Ref AutomationRoleArn
+      # Automation settings
+      AutomationTargetParameterName: InstanceId
+      MaxConcurrency: '10'
+      MaxErrors: '100%'
+      ComplianceSeverity: MEDIUM
+      # Apply to new instances immediately
+      ApplyOnlyAtCronInterval: false
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  AssociationId:
+    Description: State Manager Association ID
+    Value: !Ref DRSOnboardAssociation
