@@ -1,0 +1,85 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  EventBridge rule in the DR region for DRS Agent Lifecycle Automation.
+  Forwards DRS source server STALLED events to the source region event bus
+  so the self-heal automation can run where the EC2 instances live.
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  SourceRegion:
+    Type: String
+    Description: Source region where EC2 instances and SSM automation run
+    Default: us-west-1
+
+  AccountId:
+    Type: String
+    Description: AWS account ID
+    AllowedPattern: '[0-9]{12}'
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # EventBridge Rule: Forward STALLED events to source region
+  # DRS emits events in the DR region (where source servers are registered).
+  # This rule forwards them to the source region's default event bus so the
+  # heal automation runs alongside the EC2 instances.
+  # ---------------------------------------------------------------------------
+  DRSStalledForwardRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: DRS-Stalled-Forward
+      Description: >-
+        Forwards DRS Source Server Data Replication Stalled events from the DR
+        region to the source region default event bus for self-heal processing.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.drs
+        detail-type:
+          - DRS Source Server Data Replication Stalled Change
+      Targets:
+        - Id: ForwardToSourceRegion
+          Arn: !Sub 'arn:aws:events:${SourceRegion}:${AccountId}:event-bus/default'
+          RoleArn: !GetAtt EventBridgeForwardRole.Arn
+
+  # ---------------------------------------------------------------------------
+  # IAM Role: Allow EventBridge to put events on the source region bus
+  # ---------------------------------------------------------------------------
+  EventBridgeForwardRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DRS-EventBridge-Forward-Role
+      Description: Allows EventBridge in the DR region to forward events to the source region bus
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PutEventsToSourceRegion
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub 'arn:aws:events:${SourceRegion}:${AccountId}:event-bus/default'
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  ForwardRuleArn:
+    Description: ARN of the stalled-forward rule
+    Value: !GetAtt DRSStalledForwardRule.Arn
+
+  ForwardRoleArn:
+    Description: ARN of the EventBridge forwarding IAM role
+    Value: !GetAtt EventBridgeForwardRole.Arn
