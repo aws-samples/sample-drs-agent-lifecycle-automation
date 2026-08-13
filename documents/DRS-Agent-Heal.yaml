@@ -1,1 +1,466 @@
+schemaVersion: '0.3'
+description: >-
+  DRS agent self-heal. Triggered by EventBridge on a DRS source-server
+  STALLED/DISCONNECTED state change (minutes-level reaction to protect the
+  15-min RPO). Accepts an instance ID or ARN and normalizes it. Skips stopped
+  instances and DR=pause (maintenance). For a running, non-paused instance it
+  restarts the agent, and reinstalls if the service is missing. On-instance work
+  via aws:runCommand. Authoritative design: New solution.md
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  InstanceTarget:
+    type: String
+    description: EC2 instance ID or ARN whose source server went STALLED/DISCONNECTED.
+  TargetRegion:
+    type: String
+    default: us-east-2
+    description: DR region the agent replicates to.
+  SnsTopicArn:
+    type: String
+    default: ''
+  AuditBucket:
+    type: String
+    default: ''
+    description: S3 bucket for JSON audit reports (empty = skip S3 write).
+  CloudWatchNamespace:
+    type: String
+    default: 'DRSAutomation'
+    description: CloudWatch metric namespace for outcome metrics.
+  StandDownParameter:
+    type: String
+    default: '/drs/control/event-in-progress'
+    description: SSM Parameter Store name of the DR-event stand-down flag. When its value is true, all self-heal and alerting is paused during a declared DR event.
+  DrTagKey:
+    type: String
+    default: 'DR'
+    description: EC2 tag key that marks DR scope. Default 'DR'; override (e.g. 'DRAUTOMATIONTEST') for isolated testing.
+  DrProtectedValue:
+    type: String
+    default: 'yes'
+    description: Tag value that means "protected". Heal proceeds only when the DrTagKey value equals this (normalized, trim/lowercase).
+  AutomationAssumeRole:
+    type: String
+    default: ''
+mainSteps:
+  - name: checkStandDown
+    action: aws:executeScript
+    description: >-
+      DR-event stand-down gate. Reads StandDownParameter from SSM Parameter
+      Store; if true, a DR event (failover/failback) is in progress and self-heal
+      + alerting is paused so the automation does not fight an in-flight DR
+      operation (e.g., reverse replication). Absent/denied param = not in
+      stand-down (fail open to normal operation).
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        ParamName: '{{ StandDownParameter }}'
+      Script: |
+        import boto3
+        def handler(e, c):
+            name = e.get('ParamName') or '/drs/control/event-in-progress'
+            val = 'false'
+            try:
+                val = (boto3.client('ssm').get_parameter(Name=name)['Parameter']['Value'] or 'false').strip().lower()
+            except Exception:
+                val = 'false'
+            return {'StandDown': 'true' if val in ('true', '1', 'yes', 'on') else 'false'}
+    outputs:
+      - Name: StandDown
+        Selector: '$.Payload.StandDown'
+        Type: String
+    nextStep: branchStandDown
 
+  - name: branchStandDown
+    action: aws:branch
+    description: If a DR event is in progress, skip all heal action (audit-only record).
+    inputs:
+      Choices:
+        - NextStep: recordStandDown
+          Variable: '{{ checkStandDown.StandDown }}'
+          StringEquals: 'true'
+      Default: normalizeInstanceId
+
+  - name: recordStandDown
+    action: aws:executeScript
+    description: DR event in progress — audit-only, no self-heal, no SNS alert.
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ InstanceTarget }}'
+        Event: 'HEAL'
+        Status: 'SKIPPED_DR_EVENT'
+        Detail: 'DR-event stand-down active ({{ StandDownParameter }}=true); self-heal paused. Will resume when the flag is cleared.'
+        SnsTopicArn: ''
+        Subject: '[DRS Heal] {{ InstanceTarget }}'
+        Message: ''
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,'sourceServerID':e.get('SourceServerID',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','SKIPPED_STOPPED','SKIPPED_DR_EVENT'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
+
+  - name: normalizeInstanceId
+    action: aws:executeScript
+    description: >-
+      Resolve the target to a bare EC2 instance ID. Accepts an EC2 instance ID
+      or ARN, OR a DRS source-server ID/ARN — EventBridge delivers the
+      source-server ARN (resources[0]) on a replication-stalled event, so we
+      resolve it via drs:DescribeSourceServers (identificationHints.awsInstanceID).
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Target: '{{ InstanceTarget }}'
+        TargetRegion: '{{ TargetRegion }}'
+      Script: |
+        import boto3
+        def handler(event, context):
+            t = (event.get('Target') or '').strip()
+            region = event['TargetRegion']
+            # DRS source server (ARN like .../source-server/s-xxx, or bare s-xxx)
+            if 'source-server/' in t or t.startswith('s-'):
+                ssid = t.split('source-server/')[-1] if 'source-server/' in t else t
+                drs = boto3.client('drs', region_name=region)
+                iid = ''
+                for page in drs.get_paginator('describe_source_servers').paginate(filters={}):
+                    for s in page.get('items', []):
+                        if s.get('sourceServerID') == ssid:
+                            iid = s.get('sourceProperties', {}).get('identificationHints', {}).get('awsInstanceID', '')
+                return {'InstanceId': iid}
+            # EC2 instance ARN
+            if 'instance/' in t:
+                return {'InstanceId': t.split('instance/')[-1]}
+            # bare instance id
+            return {'InstanceId': t}
+    outputs:
+      - Name: InstanceId
+        Selector: '$.Payload.InstanceId'
+        Type: String
+    nextStep: branchResolved
+
+  - name: branchResolved
+    action: aws:branch
+    description: If we could not resolve a source-server to an EC2 instance (e.g., non-EC2 source), end gracefully.
+    inputs:
+      Choices:
+        - NextStep: describeInstance
+          Not:
+            Variable: '{{ normalizeInstanceId.InstanceId }}'
+            StringEquals: ''
+      Default: endNotResolved
+
+  - name: describeInstance
+    action: aws:executeAwsApi
+    description: Get the instance state.
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds:
+        - '{{ normalizeInstanceId.InstanceId }}'
+    outputs:
+      - Name: State
+        Selector: '$.Reservations[0].Instances[0].State.Name'
+        Type: String
+    nextStep: branchState
+
+  - name: branchState
+    action: aws:branch
+    description: Only heal a running instance; stopped/terminated is expected, no action.
+    inputs:
+      Choices:
+        - NextStep: readDrTag
+          Variable: '{{ describeInstance.State }}'
+          StringEquals: running
+      Default: endSkippedStopped
+
+  - name: readDrTag
+    action: aws:executeScript
+    description: Read the current DR tag value (defaults to 'absent', normalized). Heal proceeds only for DR=yes.
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        InstanceId: '{{ normalizeInstanceId.InstanceId }}'
+        DrTagKey: '{{ DrTagKey }}'
+        DrProtectedValue: '{{ DrProtectedValue }}'
+      Script: |
+        import boto3
+        def handler(e, c):
+            ec2=boto3.client('ec2'); iid=e['InstanceId']
+            key=(e.get('DrTagKey') or 'DR').strip()
+            protected=(e.get('DrProtectedValue') or 'yes').strip().lower()
+            dr='absent'
+            try:
+                r=ec2.describe_instances(InstanceIds=[iid]); resv=r.get('Reservations',[])
+                if resv and resv[0].get('Instances'):
+                    for t in resv[0]['Instances'][0].get('Tags',[]):
+                        if t.get('Key')==key:
+                            dr=(t.get('Value') or 'absent').strip().lower(); break
+            except Exception:
+                pass
+            return {'DrValue': dr, 'Protected': 'true' if dr==protected else 'false'}
+    outputs:
+      - Name: DrValue
+        Selector: '$.Payload.DrValue'
+        Type: String
+      - Name: Protected
+        Selector: '$.Payload.Protected'
+        Type: String
+    nextStep: branchDrProtected
+
+  - name: branchDrProtected
+    action: aws:branch
+    description: Heal only when the DR tag value equals DrProtectedValue (normalized); any other value (pause/no/absent/unexpected) suppresses heal — no action, no alert.
+    inputs:
+      Choices:
+        - NextStep: getPlatform
+          Variable: '{{ readDrTag.Protected }}'
+          StringEquals: 'true'
+      Default: endSuppressedPause
+
+  - name: getPlatform
+    action: aws:executeAwsApi
+    inputs:
+      Service: ssm
+      Api: DescribeInstanceInformation
+      Filters:
+        - Key: InstanceIds
+          Values:
+            - '{{ normalizeInstanceId.InstanceId }}'
+    outputs:
+      - Name: PlatformType
+        Selector: '$.InstanceInformationList[0].PlatformType'
+        Type: String
+    nextStep: choosePlatform
+
+  - name: choosePlatform
+    action: aws:branch
+    inputs:
+      Choices:
+        - NextStep: healLinux
+          Variable: '{{ getPlatform.PlatformType }}'
+          StringEquals: Linux
+        - NextStep: healWindows
+          Variable: '{{ getPlatform.PlatformType }}'
+          StringEquals: Windows
+    isEnd: true
+
+  - name: healLinux
+    action: aws:runCommand
+    onFailure: 'step:notifyHealFailure'
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - '{{ normalizeInstanceId.InstanceId }}'
+      Parameters:
+        executionTimeout: '3600'
+        commands:
+          - '#!/bin/bash'
+          - 'set -uo pipefail'
+          - '# Concurrency guard so a heal run cannot collide with an onboarding/heal run on the same instance'
+          - 'exec 9>/var/lock/drs-onboard.lock 2>/dev/null || exec 9>/tmp/drs-onboard.lock'
+          - 'if command -v flock >/dev/null 2>&1 && ! flock -n 9; then echo "[RESULT] SKIPPED_LOCKED - another DRS run is in progress"; exit 0; fi'
+          - 'TARGET_REGION="{{ TargetRegion }}"'
+          - 'S3_HOST="aws-elastic-disaster-recovery-${TARGET_REGION}.s3.${TARGET_REGION}.amazonaws.com"'
+          - '# Restart-first: if the agent is installed (unit loaded OR agent dir present), try restarting it.'
+          - '# Only reinstall if restart fails to bring the service active — reinstall forces a resync (RPO hit), so avoid it when a restart suffices.'
+          - 'if systemctl cat aws-replication-agent >/dev/null 2>&1 || [ -d /var/lib/aws-replication-agent ]; then'
+          - '  echo "[INFO] agent installed, attempting restart"'
+          - '  systemctl restart aws-replication-agent 2>/dev/null || true; sleep 3'
+          - '  if systemctl is-active --quiet aws-replication-agent; then echo "[RESULT] HEALED_RESTART"; exit 0; fi'
+          - '  echo "[INFO] restart did not bring agent active; proceeding to reinstall"'
+          - 'fi'
+          - 'echo "[INFO] agent missing or unrecoverable, reinstalling"'
+          - '# Clean stale installer processes / partial-install state before reinstall'
+          - 'pkill -f aws-replication-installer 2>/dev/null || true; sleep 2'
+          - 'rm -f /tmp/aws-replication-installer-64bit /tmp/aws-replication-installer-init.py'
+          - 'if [ -d /var/lib/aws-replication-agent ] && ! systemctl is-active --quiet aws-replication-agent; then rm -rf /var/lib/aws-replication-agent; fi'
+          - 'cd /tmp'
+          - 'mount | grep -q "on /tmp type tmpfs" && mount -o remount,size=2G /tmp 2>/dev/null || true'
+          - 'wget -q -O ./aws-replication-installer-init.py "https://${S3_HOST}/latest/linux/aws-replication-installer-init.py" || { echo "[ERROR] download failed"; exit 1; }'
+          - '# No installer endpoint flags: rely on private DNS (PHZ) resolving the standard DRS/S3 endpoints (--endpoint is a failback risk on EC2 per AWS docs)'
+          - 'python3 /tmp/aws-replication-installer-init.py --region "$TARGET_REGION" --no-prompt || { echo "[ERROR] reinstall failed"; exit 1; }'
+          - 'sleep 5; systemctl is-active --quiet aws-replication-agent && echo "[RESULT] HEALED_REINSTALL" || { echo "[ERROR] agent not active"; exit 1; }'
+    nextStep: notifyHealSuccess
+
+  - name: healWindows
+    action: aws:runCommand
+    onFailure: 'step:notifyHealFailure'
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds:
+        - '{{ normalizeInstanceId.InstanceId }}'
+      Parameters:
+        executionTimeout: '3600'
+        commands:
+          - '$ErrorActionPreference = "Stop"'
+          - '$TargetRegion = "{{ TargetRegion }}"'
+          - '$S3Host = "aws-elastic-disaster-recovery-$TargetRegion.s3.$TargetRegion.amazonaws.com"'
+          - '$mtx = New-Object System.Threading.Mutex($false, "Global\DRSOnboard")'
+          - 'try { $acquired = $mtx.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $acquired = $true }'
+          - 'if (-not $acquired) { Write-Output "[RESULT] SKIPPED_LOCKED - another DRS run is in progress"; exit 0 }'
+          - 'try {'
+          - '  $svc = Get-Service -Name "AwsReplicationService" -ErrorAction SilentlyContinue'
+          - '  # Restart-first: only reinstall if restart fails to bring the service Running (reinstall forces a resync / RPO hit)'
+          - '  if ($svc) { try { Restart-Service "AwsReplicationService" -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 3; $svc = Get-Service -Name "AwsReplicationService" -ErrorAction SilentlyContinue; if ($svc -and $svc.Status -eq "Running") { Write-Output "[RESULT] HEALED_RESTART"; exit 0 } } catch {}; Write-Output "[INFO] restart did not bring service Running; proceeding to reinstall" }'
+          - '  # Clean partial-install state before reinstall'
+          - '  Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "AwsReplication|replication-installer" } | Stop-Process -Force -ErrorAction SilentlyContinue'
+          - '  $agentDir = "C:\Program Files (x86)\AWS Replication Agent"'
+          - '  if (Test-Path $agentDir) { Remove-Item -Path $agentDir -Recurse -Force -ErrorAction SilentlyContinue }'
+          - '  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12'
+          - '  $path = "$env:TEMP\AwsReplicationWindowsInstaller.exe"'
+          - '  Invoke-WebRequest -Uri "https://$S3Host/latest/windows/AwsReplicationWindowsInstaller.exe" -OutFile $path -UseBasicParsing'
+          - '  # No installer endpoint flags: rely on private DNS (PHZ) for the standard DRS/S3 endpoints (--endpoint is a failback risk on EC2 per AWS docs)'
+          - '  Start-Process -FilePath $path -ArgumentList "--region $TargetRegion --no-prompt" -Wait -NoNewWindow'
+          - '  Start-Sleep -Seconds 10'
+          - '  $svc = Get-Service -Name "AwsReplicationService" -ErrorAction SilentlyContinue'
+          - '  if ($svc -and $svc.Status -eq "Running") { Write-Output "[RESULT] HEALED_REINSTALL" } else { Write-Output "[ERROR] agent not running"; exit 1 }'
+          - '} catch { Write-Output "[ERROR] $($_.Exception.Message)"; exit 1 }'
+    nextStep: notifyHealSuccess
+
+  - name: notifyHealSuccess
+    action: aws:executeScript
+    description: Notify (SNS) + write S3 audit report + emit CloudWatch metric on a successful auto-heal.
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ normalizeInstanceId.InstanceId }}'
+        Event: 'HEAL'
+        Status: 'HEALED'
+        Detail: 'Auto-heal completed (see execution for restart vs reinstall).'
+        SnsTopicArn: '{{ SnsTopicArn }}'
+        Subject: '[DRS Heal OK] {{ normalizeInstanceId.InstanceId }}'
+        Message: 'Auto-heal completed for {{ normalizeInstanceId.InstanceId }} (region {{ TargetRegion }}). A failure had occurred and was auto-remediated; review the execution for restart vs reinstall.'
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,'sourceServerID':e.get('SourceServerID',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
+
+  - name: notifyHealFailure
+    action: aws:executeScript
+    description: Notify (SNS) + write S3 audit report + emit CloudWatch metric on a failed auto-heal.
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ normalizeInstanceId.InstanceId }}'
+        Event: 'HEAL'
+        Status: 'FAILED'
+        Detail: 'Self-heal failed; replication may be breaching RPO. Check the Run Command output.'
+        SnsTopicArn: '{{ SnsTopicArn }}'
+        Subject: '[DRS Heal FAILED] {{ normalizeInstanceId.InstanceId }}'
+        Message: 'Self-heal FAILED for {{ normalizeInstanceId.InstanceId }} (region {{ TargetRegion }}). Manual intervention may be required; replication may be breaching RPO. Check the Run Command output.'
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,'sourceServerID':e.get('SourceServerID',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
+
+  - name: endSkippedStopped
+    action: aws:sleep
+    description: Instance not running — expected, no heal.
+    inputs:
+      Duration: PT1S
+    isEnd: true
+
+  - name: endSuppressedPause
+    action: aws:sleep
+    description: DR is not 'yes' (pause/no/absent/unexpected) — suppressed, no heal/alert.
+    inputs:
+      Duration: PT1S
+    isEnd: true
+
+  - name: endNotResolved
+    action: aws:sleep
+    description: Target source-server did not resolve to an EC2 instance (e.g., non-EC2 source) — no action.
+    inputs:
+      Duration: PT1S
+    isEnd: true
