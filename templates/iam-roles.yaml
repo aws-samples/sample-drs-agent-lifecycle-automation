@@ -1,1 +1,246 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  IAM role for DRS Agent Lifecycle Automation. Grants least-privilege permissions
+  for SSM Automation to manage DRS agents across source and DR regions.
 
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  AccountId:
+    Type: String
+    Description: AWS account ID
+    AllowedPattern: '[0-9]{12}'
+
+  SourceRegion:
+    Type: String
+    Description: Source region where EC2 instances run
+    Default: us-west-1
+
+  DRRegion:
+    Type: String
+    Description: DR region where DRS replicates to
+    Default: us-east-2
+
+  AuditBucketName:
+    Type: String
+    Description: S3 bucket name for audit logs (leave empty to skip S3 permissions)
+    Default: ''
+
+  SNSTopicName:
+    Type: String
+    Description: SNS topic name for notifications
+    Default: drs-alerts
+
+Conditions:
+  HasAuditBucket: !Not [!Equals [!Ref AuditBucketName, '']]
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+  DRSAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DRS-Automation-Role
+      Description: >-
+        Allows SSM Automation and EventBridge to manage DRS agent lifecycle
+        (onboard, heal, offboard) across source and DR regions.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        # --- Systems Manager Automation ---
+        - PolicyName: SSMAutomation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SSMAutomationExecution
+                Effect: Allow
+                Action:
+                  - ssm:StartAutomationExecution
+                  - ssm:GetAutomationExecution
+                  - ssm:DescribeAutomationExecutions
+                  - ssm:StopAutomationExecution
+                Resource:
+                  - !Sub 'arn:aws:ssm:${SourceRegion}:${AccountId}:automation-definition/DRS-Agent-*'
+                  - !Sub 'arn:aws:ssm:${SourceRegion}:${AccountId}:automation-execution/*'
+              - Sid: SSMRunCommand
+                Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub 'arn:aws:ssm:${SourceRegion}::document/AWS-RunShellScript'
+                  - !Sub 'arn:aws:ssm:${SourceRegion}::document/AWS-RunPowerShellScript'
+                  - !Sub 'arn:aws:ec2:${SourceRegion}:${AccountId}:instance/*'
+                Condition:
+                  StringEquals:
+                    ssm:resourceTag/DR: 'yes'
+              - Sid: SSMCommandStatus
+                Effect: Allow
+                Action:
+                  - ssm:ListCommands
+                  - ssm:ListCommandInvocations
+                  - ssm:GetCommandInvocation
+                # These read-only APIs require wildcard or command-id ARNs
+                Resource: '*'
+              - Sid: SSMDescribeInstances
+                Effect: Allow
+                Action:
+                  - ssm:DescribeInstanceInformation
+                # DescribeInstanceInformation does not support resource-level permissions
+                Resource: '*'
+
+        # --- EC2 Describe & Tag ---
+        - PolicyName: EC2Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EC2Describe
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                # Describe APIs do not support resource-level permissions
+                Resource: '*'
+              - Sid: EC2Tags
+                Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                Resource: !Sub 'arn:aws:ec2:${SourceRegion}:${AccountId}:instance/*'
+                Condition:
+                  StringEquals:
+                  aws:ResourceTag/DR: 'yes'
+
+        # --- Resource Groups & Tag API ---
+        - PolicyName: TagAPIAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: TagGetResources
+                Effect: Allow
+                Action:
+                  - tag:GetResources
+                  - tag:GetTagKeys
+                  - tag:GetTagValues
+                Resource: '*'  # Tag API requires wildcard resource
+
+        # --- DRS Cross-Region Access ---
+        - PolicyName: DRSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DRSReadWrite
+                Effect: Allow
+                Action:
+                  - drs:DescribeSourceServers
+                  - drs:DescribeRecoveryInstances
+                  - drs:GetReplicationConfiguration
+                  - drs:StopReplication
+                  - drs:DisconnectSourceServer
+                  - drs:DeleteSourceServer
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref DRRegion
+
+        # --- SNS Notifications ---
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PublishAlerts
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Sub 'arn:aws:sns:${SourceRegion}:${AccountId}:drs-*'
+
+        # --- CloudWatch Metrics ---
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PutMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: DRSAutomation
+
+        # --- S3 Audit Logs (conditional) ---
+        - !If
+          - HasAuditBucket
+          - PolicyName: S3AuditLogs
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Sid: WriteAuditLogs
+                  Effect: Allow
+                  Action:
+                    - s3:PutObject
+                  Resource: !Sub 'arn:aws:s3:::${AuditBucketName}/drs/*'
+          - !Ref AWS::NoValue
+
+        # --- SSM Parameter Store ---
+        - PolicyName: SSMParameterStore
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DRSParameters
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                Resource: !Sub 'arn:aws:ssm:${SourceRegion}:${AccountId}:parameter/drs/*'
+
+        # --- EventBridge ---
+        - PolicyName: EventBridgeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PutEvents
+                Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource:
+                  - !Sub 'arn:aws:events:${SourceRegion}:${AccountId}:event-bus/default'
+                  - !Sub 'arn:aws:events:${DRRegion}:${AccountId}:event-bus/default'
+
+        # --- IAM PassRole (self) ---
+        - PolicyName: PassRoleSelf
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PassSelf
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !Sub 'arn:aws:iam::${AccountId}:role/DRS-Automation-Role'
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ssm.amazonaws.com
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  RoleArn:
+    Description: ARN of the DRS Automation Role
+    Value: !GetAtt DRSAutomationRole.Arn
+    Export:
+      Name: DRS-Automation-Role-Arn
+
+  RoleName:
+    Description: Name of the DRS Automation Role
+    Value: !Ref DRSAutomationRole
