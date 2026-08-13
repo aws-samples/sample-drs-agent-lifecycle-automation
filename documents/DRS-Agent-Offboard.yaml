@@ -1,0 +1,801 @@
+schemaVersion: '0.3'
+description: >-
+  DRS offboarding teardown. Triggered by EventBridge when the DR tag changes
+  yes->no or is deleted. Accepts an instance ID or ARN (EventBridge passes an
+  ARN), normalizes it, re-checks the tag, then (state-aware) stops replication,
+  deletes the source server, uninstalls the agent, and removes the failback tag.
+  stop_replication is the verified BILLING checkpoint; the completion status is
+  honest (COMPLETED / BILLING_STOPPED_ORPHAN / FAILED) and never claims billing
+  stopped when it did not. Also reports replication state/lag at teardown and
+  flags residual recovery instances. Action-taking by default
+  (AutoOffboardEnabled=true). Authoritative design: New solution.md
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  InstanceTarget:
+    type: String
+    description: EC2 instance ID or ARN descoped from DR (EventBridge passes the ARN).
+  TargetRegion:
+    type: String
+    default: us-east-2
+    description: DR region where the source server lives.
+  AutoOffboardEnabled:
+    type: String
+    allowedValues: ['true', 'false']
+    default: 'true'
+    description: 'true = execute teardown; false = notify only (approve-then-teardown).'
+  SnsTopicArn:
+    type: String
+    default: ''
+    description: SNS topic for offboarding notifications.
+  AuditBucket:
+    type: String
+    default: ''
+    description: S3 bucket for JSON audit reports (empty = skip S3 write).
+  CloudWatchNamespace:
+    type: String
+    default: 'DRSAutomation'
+    description: CloudWatch metric namespace for outcome metrics.
+  StandDownParameter:
+    type: String
+    default: '/drs/control/event-in-progress'
+    description: SSM Parameter Store name of the DR-event stand-down flag. When its value is true, offboarding teardown is paused so a source server is never torn down during a declared DR event.
+  DrTagKey:
+    type: String
+    default: 'DR'
+    description: EC2 tag key that marks DR scope. Default 'DR'; override (e.g. 'DRAUTOMATIONTEST') for isolated testing.
+  DrDescopeValue:
+    type: String
+    default: 'no'
+    description: Tag value that means "descoped". Teardown runs only when the DrTagKey value equals this (normalized) OR the tag is absent/deleted; any other value is a no-op.
+  AutomationAssumeRole:
+    type: String
+    default: ''
+    description: IAM role ARN for the Automation to assume.
+mainSteps:
+  - name: checkStandDown
+    action: aws:executeScript
+    description: >-
+      DR-event stand-down gate. Reads StandDownParameter from SSM Parameter
+      Store; if true, a DR event (failover/failback) is in progress and
+      offboarding teardown is paused — a source server must never be torn down
+      during a declared DR event (it may be the recovery point). Absent/denied
+      param = not in stand-down (fail open to normal operation).
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        ParamName: '{{ StandDownParameter }}'
+      Script: |
+        import boto3
+        def handler(e, c):
+            name = e.get('ParamName') or '/drs/control/event-in-progress'
+            val = 'false'
+            try:
+                val = (boto3.client('ssm').get_parameter(Name=name)['Parameter']['Value'] or 'false').strip().lower()
+            except Exception:
+                val = 'false'
+            return {'StandDown': 'true' if val in ('true', '1', 'yes', 'on') else 'false'}
+    outputs:
+      - Name: StandDown
+        Selector: '$.Payload.StandDown'
+        Type: String
+    nextStep: branchStandDown
+
+  - name: branchStandDown
+    action: aws:branch
+    description: If a DR event is in progress, skip teardown (audit-only record).
+    inputs:
+      Choices:
+        - NextStep: recordStandDown
+          Variable: '{{ checkStandDown.StandDown }}'
+          StringEquals: 'true'
+      Default: normalizeInstanceId
+
+  - name: recordStandDown
+    action: aws:executeScript
+    description: DR event in progress — audit-only, no teardown, no SNS alert.
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ InstanceTarget }}'
+        Event: 'OFFBOARD'
+        Status: 'SKIPPED_DR_EVENT'
+        Detail: 'DR-event stand-down active ({{ StandDownParameter }}=true); offboarding teardown paused. Source server left intact. Will resume when the flag is cleared.'
+        SnsTopicArn: ''
+        Subject: '[DRS Offboarding] {{ InstanceTarget }}'
+        Message: ''
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,'sourceServerID':e.get('SourceServerID',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','NO_SERVER','SKIPPED_TERMINATED','SKIPPED_DR_EVENT'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
+
+  - name: normalizeInstanceId
+    action: aws:executeScript
+    description: Accept an instance ID or ARN and return the bare instance ID.
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Target: '{{ InstanceTarget }}'
+      Script: |
+        def handler(event, context):
+            t = event['Target']
+            # ARN form: arn:aws:ec2:region:acct:instance/i-xxxx
+            iid = t.split('instance/')[-1] if 'instance/' in t else t
+            return {'InstanceId': iid.strip()}
+    outputs:
+      - Name: InstanceId
+        Selector: '$.Payload.InstanceId'
+        Type: String
+    nextStep: assessInstance
+
+  - name: assessInstance
+    action: aws:executeScript
+    description: >-
+      Read the instance state AND the current DR tag in one call. This
+      distinguishes a genuine descope (live instance, DR=no/absent) from
+      instance TERMINATION (state terminated / not-found). Termination strips
+      the DR tag and fires the same tag-change rule, but must NOT auto-teardown
+      the source server — termination is indistinguishable from a disaster and
+      the source server may be the recovery point. Also returns a defaulted
+      DrValue ('absent') so notifications never show an unresolved placeholder.
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        InstanceId: '{{ normalizeInstanceId.InstanceId }}'
+        DrTagKey: '{{ DrTagKey }}'
+        DrDescopeValue: '{{ DrDescopeValue }}'
+      Script: |
+        import boto3
+        def handler(event, context):
+            ec2 = boto3.client('ec2')
+            iid = event['InstanceId']
+            key = (event.get('DrTagKey') or 'DR').strip()
+            descope_val = (event.get('DrDescopeValue') or 'no').strip().lower()
+            state = 'not-found'; dr = 'absent'
+            try:
+                r = ec2.describe_instances(InstanceIds=[iid])
+                resv = r.get('Reservations', [])
+                if resv and resv[0].get('Instances'):
+                    inst = resv[0]['Instances'][0]
+                    state = inst.get('State', {}).get('Name', 'unknown')
+                    for t in inst.get('Tags', []):
+                        if t.get('Key') == key:
+                            dr = (t.get('Value') or 'absent').strip().lower()
+                            break
+            except Exception:
+                # InvalidInstanceID.NotFound (instance fully gone) -> not-found
+                state = 'not-found'
+            descope = 'true' if (dr == descope_val or dr == 'absent') else 'false'
+            return {'InstanceState': state, 'DrValue': dr, 'Descope': descope}
+    outputs:
+      - Name: InstanceState
+        Selector: '$.Payload.InstanceState'
+        Type: String
+      - Name: DrValue
+        Selector: '$.Payload.DrValue'
+        Type: String
+      - Name: Descope
+        Selector: '$.Payload.Descope'
+        Type: String
+    nextStep: branchTerminated
+
+  - name: branchTerminated
+    action: aws:branch
+    description: >-
+      If the instance is terminated or no longer exists, alert only — do NOT
+      tear down the source server (it may be a disaster recovery point).
+    inputs:
+      Choices:
+        - NextStep: notifyTerminatedNoAction
+          Variable: '{{ assessInstance.InstanceState }}'
+          StringEquals: 'terminated'
+        - NextStep: notifyTerminatedNoAction
+          Variable: '{{ assessInstance.InstanceState }}'
+          StringEquals: 'not-found'
+      Default: branchOffboard
+
+  - name: branchOffboard
+    action: aws:branch
+    description: >-
+      Tear down ONLY on an explicit descope — DR value equals DrDescopeValue, or
+      tag deleted (absent) on a live instance (terminated/not-found already
+      handled by branchTerminated). Any other value (protected/pause/unexpected)
+      is a no-op, so a typo or unexpected tag value never triggers teardown.
+      The descope decision is computed (normalized) in assessInstance.
+    inputs:
+      Choices:
+        - NextStep: checkAutoOffboard
+          Variable: '{{ assessInstance.Descope }}'
+          StringEquals: 'true'
+      Default: endNoOp
+
+  - name: checkAutoOffboard
+    action: aws:branch
+    description: Honor the AutoOffboardEnabled toggle.
+    inputs:
+      Choices:
+        - NextStep: notifyStart
+          Variable: '{{ AutoOffboardEnabled }}'
+          StringEquals: 'true'
+      Default: notifyApprovalNeeded
+
+  - name: notifyApprovalNeeded
+    action: aws:executeScript
+    description: Approve-then-teardown mode — notify (SNS) + audit, do not tear down.
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ normalizeInstanceId.InstanceId }}'
+        Event: 'OFFBOARD'
+        Status: 'APPROVAL_NEEDED'
+        Detail: 'Descoped but AutoOffboardEnabled=false — teardown requires manual approval.'
+        SnsTopicArn: '{{ SnsTopicArn }}'
+        Subject: '[DRS Offboarding APPROVAL NEEDED] {{ normalizeInstanceId.InstanceId }}'
+        Message: 'Instance {{ normalizeInstanceId.InstanceId }} was descoped from DR (DR={{ assessInstance.DrValue }}). AutoOffboardEnabled=false — teardown requires manual approval.'
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,'sourceServerID':e.get('SourceServerID',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','NO_SERVER'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
+
+  - name: notifyStart
+    action: aws:executeAwsApi
+    onFailure: Continue
+    inputs:
+      Service: sns
+      Api: Publish
+      TopicArn: '{{ SnsTopicArn }}'
+      Subject: '[DRS Offboarding STARTED] {{ normalizeInstanceId.InstanceId }}'
+      Message: 'Offboarding started for {{ normalizeInstanceId.InstanceId }} (DR={{ assessInstance.DrValue }}). Stopping replication (billing checkpoint), deleting source server, uninstalling agent, removing failback tag.'
+    nextStep: findSourceServer
+
+  - name: findSourceServer
+    action: aws:executeScript
+    description: Resolve the DRS sourceServerID for this EC2 instance (client-side match on awsInstanceID). Adaptive retry handles throttling at scale.
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        InstanceId: '{{ normalizeInstanceId.InstanceId }}'
+        Region: '{{ TargetRegion }}'
+      Script: |
+        import boto3
+        from botocore.config import Config
+        def handler(event, context):
+            cfg = Config(retries={'max_attempts': 10, 'mode': 'adaptive'})
+            drs = boto3.client('drs', region_name=event['Region'], config=cfg)
+            iid = event['InstanceId']
+            paginator = drs.get_paginator('describe_source_servers')
+            for page in paginator.paginate(filters={}):
+                for s in page.get('items', []):
+                    hints = s.get('sourceProperties', {}).get('identificationHints', {})
+                    if hints.get('awsInstanceID') == iid:
+                        return {'SourceServerID': s['sourceServerID']}
+            return {'SourceServerID': ''}
+    outputs:
+      - Name: SourceServerID
+        Selector: '$.Payload.SourceServerID'
+        Type: String
+    nextStep: teardownDrs
+
+  - name: teardownDrs
+    action: aws:executeScript
+    description: >-
+      State-aware DRS teardown in TargetRegion (boto3 with adaptive retry).
+      (1) describe the source server to record replication state / lag /
+      last-replicated for the audit; (2) check for residual recovery instances
+      (billed separately) and flag them; (3) stop replication — the VERIFIED
+      BILLING checkpoint (an already stopped/disconnected server counts as
+      billing-stopped); (4) disconnect; (5) delete (retried, since disconnect is
+      async). Returns an HONEST TeardownStatus:
+        COMPLETED               = source server deleted, billing halted
+        BILLING_STOPPED_ORPHAN  = replication stopped (billing halted) but the
+                                  source server could not be deleted (orphan record)
+        FAILED                  = neither stop nor delete succeeded (billing may
+                                  still be running)
+        NO_SERVER               = no source server registered (nothing to tear down)
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        SourceServerID: '{{ findSourceServer.SourceServerID }}'
+        Region: '{{ TargetRegion }}'
+      Script: |
+        import boto3, time
+        from botocore.config import Config
+        def handler(event, context):
+            ssid = (event.get('SourceServerID') or '').strip()
+            region = event['Region']
+            cfg = Config(retries={'max_attempts': 10, 'mode': 'adaptive'})
+            drs = boto3.client('drs', region_name=region, config=cfg)
+            res = {'sourceServerID': ssid, 'StateAtTeardown': 'NONE', 'Lag': '',
+                   'LastReplicated': '', 'BillingStopped': False, 'Deleted': False,
+                   'RecoveryInfo': 'none'}
+            if not ssid:
+                res['TeardownStatus'] = 'NO_SERVER'
+                res['Detail'] = 'No source server registered for this instance; nothing to tear down (no DRS billing).'
+                return res
+
+            # (1) describe-first: capture replication state / lag / last-replicated
+            state = 'UNKNOWN'
+            try:
+                items = drs.describe_source_servers(filters={'sourceServerIDs': [ssid]}).get('items', [])
+                if items:
+                    dri = items[0].get('dataReplicationInfo', {}) or {}
+                    state = dri.get('dataReplicationState', 'UNKNOWN') or 'UNKNOWN'
+                    res['StateAtTeardown'] = state
+                    res['Lag'] = str(dri.get('lagDuration', '') or '')
+                    res['LastReplicated'] = str(dri.get('lastSnapshotDateTime', '') or '')
+            except Exception as e:
+                res['describeError'] = type(e).__name__
+
+            # (2) residual cost: recovery instances tied to this source server
+            try:
+                ri = drs.describe_recovery_instances(filters={'sourceServerIDs': [ssid]}).get('items', [])
+                ids = [r.get('recoveryInstanceID', '') for r in ri if r.get('recoveryInstanceID')]
+                if ids:
+                    res['RecoveryInfo'] = '%d recovery instance(s) still present (billed separately - review/terminate): %s' % (len(ids), ','.join(ids))
+            except Exception as e:
+                res['recoveryCheckError'] = type(e).__name__
+
+            su = (state or '').upper()
+            # (3) stop replication = the BILLING checkpoint
+            billing_stopped = False
+            try:
+                drs.stop_replication(sourceServerID=ssid)
+                billing_stopped = True
+            except Exception as e:
+                name = type(e).__name__
+                # already stopped / disconnected -> conflict/validation -> billing already off
+                if 'Conflict' in name or 'Validation' in name or su in ('STOPPED', 'DISCONNECTED'):
+                    billing_stopped = True
+                    res['stopNote'] = 'already-stopped:%s' % name
+                else:
+                    res['stopError'] = name
+            res['BillingStopped'] = billing_stopped
+
+            # (4) disconnect (required before delete; async). Idempotent / tolerant.
+            try:
+                drs.disconnect_source_server(sourceServerID=ssid)
+            except Exception as e:
+                res['disconnectNote'] = type(e).__name__
+
+            # (5) delete with retry (disconnect settles asynchronously)
+            deleted = False
+            for _ in range(6):
+                try:
+                    drs.delete_source_server(sourceServerID=ssid)
+                    deleted = True
+                    break
+                except drs.exceptions.ResourceNotFoundException:
+                    deleted = True
+                    break
+                except Exception as e:
+                    res['deleteAttempt'] = type(e).__name__
+                    time.sleep(10)
+            res['Deleted'] = deleted
+
+            # honest status — never claim billing stopped unless it actually did
+            if deleted:
+                status = 'COMPLETED'
+                detail = 'Source server %s deleted; replication stopped; billing halted.' % ssid
+            elif billing_stopped:
+                status = 'BILLING_STOPPED_ORPHAN'
+                detail = 'Replication STOPPED (billing halted) but source server %s could NOT be deleted - orphan record remains; delete it manually.' % ssid
+            else:
+                status = 'FAILED'
+                detail = 'Teardown FAILED - replication may STILL be billing for %s. Stop replication manually in the DR region and investigate.' % ssid
+            if res['RecoveryInfo'] != 'none':
+                detail += ' NOTE: ' + res['RecoveryInfo']
+            res['TeardownStatus'] = status
+            res['Detail'] = detail
+            return res
+    outputs:
+      - Name: TeardownStatus
+        Selector: '$.Payload.TeardownStatus'
+        Type: String
+      - Name: BillingStopped
+        Selector: '$.Payload.BillingStopped'
+        Type: Boolean
+      - Name: Deleted
+        Selector: '$.Payload.Deleted'
+        Type: Boolean
+      - Name: StateAtTeardown
+        Selector: '$.Payload.StateAtTeardown'
+        Type: String
+      - Name: Lag
+        Selector: '$.Payload.Lag'
+        Type: String
+      - Name: LastReplicated
+        Selector: '$.Payload.LastReplicated'
+        Type: String
+      - Name: RecoveryInfo
+        Selector: '$.Payload.RecoveryInfo'
+        Type: String
+      - Name: Detail
+        Selector: '$.Payload.Detail'
+        Type: String
+    nextStep: uninstallAgent
+
+  - name: uninstallAgent
+    action: aws:executeScript
+    description: Uninstall the DRS agent on the instance, OS-aware (best-effort; instance may already be gone).
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        InstanceId: '{{ normalizeInstanceId.InstanceId }}'
+      Script: |
+        import boto3
+        def handler(event, context):
+            ssm = boto3.client('ssm')
+            iid = event['InstanceId']
+            info = ssm.describe_instance_information(Filters=[{'Key':'InstanceIds','Values':[iid]}])
+            lst = info.get('InstanceInformationList', [])
+            if not lst:
+                return {'Status': 'instance-not-managed-skip'}
+            platform = lst[0].get('PlatformType', 'Linux')
+            if platform == 'Windows':
+                doc = 'AWS-RunPowerShellScript'
+                cmds = [
+                    '$svcs=@("AwsReplicationService","AwsReplicationDriverLogger","AwsReplicationLogger","AwsReplicationVolumeUpdaterService")',
+                    'foreach($s in $svcs){ if(Get-Service -Name $s -ErrorAction SilentlyContinue){ Stop-Service $s -Force -ErrorAction SilentlyContinue } }',
+                    'Remove-Item -Recurse -Force "C:\\Program Files (x86)\\AWS Replication Agent" -ErrorAction SilentlyContinue',
+                    'Write-Output "agent-uninstalled"'
+                ]
+            else:
+                doc = 'AWS-RunShellScript'
+                cmds = [
+                    'systemctl stop aws-replication-agent 2>/dev/null || true',
+                    'systemctl disable aws-replication-agent 2>/dev/null || true',
+                    'rm -rf /var/lib/aws-replication-agent || true',
+                    '# Release the hostname lock applied during onboarding (chattr +i /etc/hostname);',
+                    '# a descoped instance must not be left with an immutable hostname file.',
+                    'if command -v chattr >/dev/null 2>&1 && [ ! -L /etc/hostname ]; then chattr -i /etc/hostname 2>/dev/null && echo hostname-unlocked || true; fi',
+                    'echo agent-uninstalled'
+                ]
+            try:
+                r = ssm.send_command(InstanceIds=[iid], DocumentName=doc,
+                                     Parameters={'commands': cmds})
+                return {'Status': 'uninstall-sent', 'CommandId': r['Command']['CommandId']}
+            except Exception as e:
+                return {'Status': 'uninstall-skip', 'Error': str(e)}
+    nextStep: removeFailbackTag
+
+  - name: removeFailbackTag
+    action: aws:executeAwsApi
+    onFailure: Continue
+    description: Remove the AWSDRS failback tag from the instance.
+    inputs:
+      Service: ec2
+      Api: DeleteTags
+      Resources:
+        - '{{ normalizeInstanceId.InstanceId }}'
+      Tags:
+        - Key: AWSDRS
+    nextStep: branchTeardownOutcome
+
+  - name: branchTeardownOutcome
+    action: aws:branch
+    description: >-
+      Route to an HONEST terminal notification based on the actual teardown
+      result. FAILED and BILLING_STOPPED_ORPHAN raise alerts; COMPLETED /
+      NO_SERVER report success.
+    inputs:
+      Choices:
+        - NextStep: notifyTeardownFailed
+          Variable: '{{ teardownDrs.TeardownStatus }}'
+          StringEquals: 'FAILED'
+        - NextStep: notifyOrphanRecord
+          Variable: '{{ teardownDrs.TeardownStatus }}'
+          StringEquals: 'BILLING_STOPPED_ORPHAN'
+      Default: notifyComplete
+
+  - name: notifyComplete
+    action: aws:executeScript
+    description: Notify (SNS) + write enriched S3 audit + emit CloudWatch metric on a clean offboarding (COMPLETED / NO_SERVER).
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ normalizeInstanceId.InstanceId }}'
+        Event: 'OFFBOARD'
+        Status: '{{ teardownDrs.TeardownStatus }}'
+        SourceServerID: '{{ findSourceServer.SourceServerID }}'
+        StateAtTeardown: '{{ teardownDrs.StateAtTeardown }}'
+        Lag: '{{ teardownDrs.Lag }}'
+        LastReplicated: '{{ teardownDrs.LastReplicated }}'
+        BillingStopped: '{{ teardownDrs.BillingStopped }}'
+        Deleted: '{{ teardownDrs.Deleted }}'
+        RecoveryInfo: '{{ teardownDrs.RecoveryInfo }}'
+        Detail: '{{ teardownDrs.Detail }}'
+        SnsTopicArn: '{{ SnsTopicArn }}'
+        Subject: '[DRS Offboarding {{ teardownDrs.TeardownStatus }}] {{ normalizeInstanceId.InstanceId }}'
+        Message: 'Offboarding finished for {{ normalizeInstanceId.InstanceId }} (status {{ teardownDrs.TeardownStatus }}). {{ teardownDrs.Detail }}'
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,
+                 'sourceServerID':e.get('SourceServerID',''),
+                 'replicationStateAtTeardown':e.get('StateAtTeardown',''),
+                 'lagAtTeardown':e.get('Lag',''),'lastReplicated':e.get('LastReplicated',''),
+                 'billingStopped':e.get('BillingStopped',''),'deleted':e.get('Deleted',''),
+                 'recoveryInfo':e.get('RecoveryInfo',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','NO_SERVER','SKIPPED_TERMINATED','SKIPPED_DR_EVENT'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
+
+  - name: notifyOrphanRecord
+    action: aws:executeScript
+    description: >-
+      Replication stopped (billing halted) but the source server could not be
+      deleted — an orphan record remains. SNS alert + enriched audit + metric=0
+      (needs cleanup). Billing is NOT running; this is a hygiene follow-up.
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ normalizeInstanceId.InstanceId }}'
+        Event: 'OFFBOARD'
+        Status: 'BILLING_STOPPED_ORPHAN'
+        SourceServerID: '{{ findSourceServer.SourceServerID }}'
+        StateAtTeardown: '{{ teardownDrs.StateAtTeardown }}'
+        Lag: '{{ teardownDrs.Lag }}'
+        LastReplicated: '{{ teardownDrs.LastReplicated }}'
+        BillingStopped: '{{ teardownDrs.BillingStopped }}'
+        Deleted: '{{ teardownDrs.Deleted }}'
+        RecoveryInfo: '{{ teardownDrs.RecoveryInfo }}'
+        Detail: '{{ teardownDrs.Detail }}'
+        SnsTopicArn: '{{ SnsTopicArn }}'
+        Subject: '[DRS Offboarding - billing stopped, ORPHAN record] {{ normalizeInstanceId.InstanceId }}'
+        Message: 'Offboarding for {{ normalizeInstanceId.InstanceId }}: replication STOPPED (billing halted) but source server {{ findSourceServer.SourceServerID }} could NOT be deleted. Delete the orphan source server manually in the DR region. {{ teardownDrs.Detail }}'
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,
+                 'sourceServerID':e.get('SourceServerID',''),
+                 'replicationStateAtTeardown':e.get('StateAtTeardown',''),
+                 'lagAtTeardown':e.get('Lag',''),'lastReplicated':e.get('LastReplicated',''),
+                 'billingStopped':e.get('BillingStopped',''),'deleted':e.get('Deleted',''),
+                 'recoveryInfo':e.get('RecoveryInfo',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','NO_SERVER','SKIPPED_TERMINATED','SKIPPED_DR_EVENT'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
+
+  - name: notifyTeardownFailed
+    action: aws:executeScript
+    description: >-
+      DRS teardown FAILED — replication may still be billing. SNS alert +
+      enriched audit + metric=0. Operator must stop replication / delete the
+      source server manually in the DR region.
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ normalizeInstanceId.InstanceId }}'
+        Event: 'OFFBOARD'
+        Status: 'OFFBOARD_FAILED'
+        SourceServerID: '{{ findSourceServer.SourceServerID }}'
+        StateAtTeardown: '{{ teardownDrs.StateAtTeardown }}'
+        Lag: '{{ teardownDrs.Lag }}'
+        LastReplicated: '{{ teardownDrs.LastReplicated }}'
+        BillingStopped: '{{ teardownDrs.BillingStopped }}'
+        Deleted: '{{ teardownDrs.Deleted }}'
+        RecoveryInfo: '{{ teardownDrs.RecoveryInfo }}'
+        Detail: '{{ teardownDrs.Detail }}'
+        SnsTopicArn: '{{ SnsTopicArn }}'
+        Subject: '[DRS Offboarding FAILED] {{ normalizeInstanceId.InstanceId }}'
+        Message: 'Offboarding FAILED for {{ normalizeInstanceId.InstanceId }}: DRS teardown of {{ findSourceServer.SourceServerID }} did not complete and replication may STILL be billing. Stop replication / delete the source server manually in the DR region. {{ teardownDrs.Detail }}'
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,
+                 'sourceServerID':e.get('SourceServerID',''),
+                 'replicationStateAtTeardown':e.get('StateAtTeardown',''),
+                 'lagAtTeardown':e.get('Lag',''),'lastReplicated':e.get('LastReplicated',''),
+                 'billingStopped':e.get('BillingStopped',''),'deleted':e.get('Deleted',''),
+                 'recoveryInfo':e.get('RecoveryInfo',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','NO_SERVER','SKIPPED_TERMINATED','SKIPPED_DR_EVENT'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
+
+  - name: notifyTerminatedNoAction
+    action: aws:executeScript
+    description: >-
+      Instance is terminated / not-found — alert only, NO DRS teardown.
+      Termination strips the DR tag and fires the offboarding rule, but a
+      terminated instance is indistinguishable from a disaster, so the source
+      server is left intact (it may be the recovery point). SOP: set DR=no to
+      offboard cleanly BEFORE terminating.
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ normalizeInstanceId.InstanceId }}'
+        Event: 'OFFBOARD'
+        Status: 'SKIPPED_TERMINATED'
+        Detail: 'Instance terminated/not-found. Teardown intentionally skipped (termination is indistinguishable from a disaster; source server may be the recovery point). Review and remove the orphaned source server manually if the termination was intentional.'
+        SnsTopicArn: '{{ SnsTopicArn }}'
+        Subject: '[DRS Offboarding SKIPPED - instance terminated] {{ normalizeInstanceId.InstanceId }}'
+        Message: 'Offboarding was triggered for {{ normalizeInstanceId.InstanceId }} but the instance is terminated/not-found (state={{ assessInstance.InstanceState }}, DR={{ assessInstance.DrValue }}). NO teardown was performed - termination is indistinguishable from a disaster and the DRS source server may be needed for recovery. If this termination was intentional, remove the orphaned source server manually. SOP: set DR=no to offboard cleanly BEFORE terminating.'
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,'sourceServerID':e.get('SourceServerID',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','NO_SERVER','SKIPPED_TERMINATED','SKIPPED_DR_EVENT'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
+
+  - name: endNoOp
+    action: aws:sleep
+    description: DR is yes/pause or an unexpected value (not no/absent) — no offboarding action (no teardown).
+    inputs:
+      Duration: PT1S
+    isEnd: true
