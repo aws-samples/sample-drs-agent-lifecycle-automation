@@ -108,6 +108,9 @@ Resources:
           - aws.drs
         detail-type:
           - DRS Source Server Data Replication Stalled Change
+          detail:
+          state:
+            - STALLED
       Targets:
         - Id: DRSHealAutomation
           Arn: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${HealDocumentName}'
