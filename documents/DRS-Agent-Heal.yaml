@@ -4,8 +4,11 @@ description: >-
   STALLED/DISCONNECTED state change (minutes-level reaction to protect the
   15-min RPO). Accepts an instance ID or ARN and normalizes it. Skips stopped
   instances and DR=pause (maintenance). For a running, non-paused instance it
-  restarts the agent, and reinstalls if the service is missing. On-instance work
-  via aws:runCommand. Authoritative design: New solution.md
+  classifies the stall cause via dataReplicationError — agent-side failures
+  proceed to restart/reinstall, infrastructure-caused stalls escalate to
+  operators via SNS. Reinstall preserves existing agent directory to avoid
+  full-disk rescan. On-instance work via aws:runCommand.
+  Authoritative design: New solution.md
 assumeRole: '{{ AutomationAssumeRole }}'
 parameters:
   InstanceTarget:
@@ -243,10 +246,165 @@ mainSteps:
     description: Heal only when the DR tag value equals DrProtectedValue (normalized); any other value (pause/no/absent/unexpected) suppresses heal — no action, no alert.
     inputs:
       Choices:
-        - NextStep: getPlatform
+        - NextStep: classifyStallCause
           Variable: '{{ readDrTag.Protected }}'
           StringEquals: 'true'
       Default: endSuppressedPause
+
+  # ---------------------------------------------------------------------------
+  # NEW: Classify stall cause before attempting remediation
+  # Inspects dataReplicationInfo.dataReplicationError from DescribeSourceServers.
+  # Agent-side errors (AGENT_NOT_SEEN, connection/pairing failures) proceed to
+  # restart/reinstall. Infrastructure errors (replication server, staging disk,
+  # network) skip agent remediation and escalate to operators via SNS.
+  # ---------------------------------------------------------------------------
+  - name: classifyStallCause
+    action: aws:executeScript
+    description: >-
+      Inspect dataReplicationInfo.dataReplicationError to determine if the stall
+      is agent-related (restart/reinstall may help) or infrastructure-related
+      (escalate to operators via SNS). Uses adaptive retry for DRS API
+      throttling resilience.
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        InstanceId: '{{ normalizeInstanceId.InstanceId }}'
+        TargetRegion: '{{ TargetRegion }}'
+      Script: |
+        import boto3
+        from botocore.config import Config
+
+        def handler(event, context):
+            region = event['TargetRegion']
+            iid = event['InstanceId']
+            drs = boto3.client('drs', region_name=region,
+                               config=Config(retries={'mode': 'adaptive', 'max_attempts': 10}))
+            cause = 'UNKNOWN'
+            error_code = ''
+            raw_error = ''
+
+            # Agent-side errors where restart/reinstall may help
+            agent_errors = {
+                'AGENT_NOT_SEEN',
+                'FAILED_TO_CONNECT_AGENT_TO_REPLICATION_SERVER',
+                'FAILED_TO_PAIR_REPLICATION_SERVER_WITH_AGENT',
+            }
+            # Infrastructure errors where agent remediation won't help
+            infra_errors = {
+                'NOT_CONVERGING',
+                'UNSTABLE_NETWORK',
+                'FAILED_TO_CREATE_SECURITY_GROUP',
+                'FAILED_TO_LAUNCH_REPLICATION_SERVER',
+                'FAILED_TO_BOOT_REPLICATION_SERVER',
+                'FAILED_TO_CREATE_STAGING_DISKS',
+                'FAILED_TO_ATTACH_STAGING_DISKS',
+                'FAILED_TO_START_DATA_TRANSFER',
+                'SNAPSHOTS_FAILURE',
+            }
+
+            try:
+                for page in drs.get_paginator('describe_source_servers').paginate(filters={}):
+                    for s in page.get('items', []):
+                        props = s.get('sourceProperties', {})
+                        hints = props.get('identificationHints', {})
+                        if hints.get('awsInstanceID') == iid:
+                            info = s.get('dataReplicationInfo', {})
+                            err_obj = info.get('dataReplicationError', {}) or {}
+                            error_code = err_obj.get('error', '') or ''
+                            raw_error = err_obj.get('rawError', '') or ''
+                            if error_code in agent_errors:
+                                cause = 'AGENT'
+                            elif error_code in infra_errors:
+                                cause = 'INFRA'
+                            elif error_code == '':
+                                # No error code — stall may have resolved or cause is
+                                # transient. Default to agent restart (low cost, safe).
+                                cause = 'AGENT'
+                            else:
+                                # Unknown error code — default to agent (fail-open)
+                                cause = 'AGENT'
+                            return {'Cause': cause, 'ErrorCode': error_code, 'RawError': raw_error}
+            except Exception as ex:
+                # API failure — fail-open to agent heal attempt
+                return {'Cause': 'AGENT', 'ErrorCode': 'CLASSIFY_ERROR', 'RawError': str(ex)}
+
+            # Source server not found for this instance — attempt heal anyway
+            return {'Cause': 'AGENT', 'ErrorCode': 'SOURCE_NOT_FOUND', 'RawError': ''}
+    outputs:
+      - Name: Cause
+        Selector: '$.Payload.Cause'
+        Type: String
+      - Name: ErrorCode
+        Selector: '$.Payload.ErrorCode'
+        Type: String
+      - Name: RawError
+        Selector: '$.Payload.RawError'
+        Type: String
+    nextStep: branchStallCause
+
+  - name: branchStallCause
+    action: aws:branch
+    description: >-
+      Agent-side stalls proceed to restart/reinstall. Infrastructure stalls
+      escalate to operators via SNS — restarting the agent won't help.
+    inputs:
+      Choices:
+        - NextStep: getPlatform
+          Variable: '{{ classifyStallCause.Cause }}'
+          StringEquals: 'AGENT'
+      Default: notifyInfraStall
+
+  - name: notifyInfraStall
+    action: aws:executeScript
+    description: >-
+      Infrastructure-caused stall — agent remediation won't help. Escalate to
+      operators with the specific error code. Writes audit record and CloudWatch
+      metric (value 0 = operator action needed).
+    onFailure: Continue
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Account: '{{ global:ACCOUNT_ID }}'
+        InstanceId: '{{ normalizeInstanceId.InstanceId }}'
+        Event: 'HEAL'
+        Status: 'ESCALATED_INFRA'
+        Detail: 'Stall caused by infrastructure ({{ classifyStallCause.ErrorCode }}), not agent. Agent restart/reinstall skipped. Operator action required. Raw: {{ classifyStallCause.RawError }}'
+        SnsTopicArn: '{{ SnsTopicArn }}'
+        Subject: '[DRS Heal ESCALATED] {{ normalizeInstanceId.InstanceId }} — infra stall'
+        Message: 'Replication stall on {{ normalizeInstanceId.InstanceId }} is infrastructure-caused ({{ classifyStallCause.ErrorCode }}). Agent remediation skipped. Check replication server, staging disks, and network in {{ TargetRegion }}. Raw error: {{ classifyStallCause.RawError }}'
+        Bucket: '{{ AuditBucket }}'
+        Namespace: '{{ CloudWatchNamespace }}'
+      Script: |
+        import boto3, json
+        from datetime import datetime
+        def handler(e, c):
+            status=e.get('Status',''); event=e.get('Event',''); iid=e.get('InstanceId','')
+            ts=datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+            rec={'instanceId':iid,'event':event,'overallStatus':status,'sourceServerID':e.get('SourceServerID',''),'detail':e.get('Detail',''),'timestamp':ts}
+            out={}
+            topic=e.get('SnsTopicArn') or ''
+            if topic:
+                try:
+                    boto3.client('sns').publish(TopicArn=topic, Subject=(e.get('Subject') or 'DRS')[:100], Message=(e.get('Message') or json.dumps(rec)))
+                    out['sns']='sent'
+                except Exception as ex: out['snsError']=str(ex)
+            good={'SUCCESS','HEALED','HEALED_RESTART','HEALED_REINSTALL','SKIPPED_HEALTHY','HEALTHY','IN_PROGRESS','AUDIT_NOACTION','PENDING_REGISTRATION','COMPLETED','SKIPPED_STOPPED','SKIPPED_DR_EVENT'}
+            try:
+                boto3.client('cloudwatch').put_metric_data(Namespace=e.get('Namespace','DRSAutomation'),
+                  MetricData=[{'MetricName':'Outcome','Value':1 if status in good else 0,'Unit':'Count','Dimensions':[{'Name':'Event','Value':event}]}])
+                out['metric']='ok'
+            except Exception as ex: out['metricError']=str(ex)
+            bucket=e.get('Bucket') or ''
+            if bucket:
+                try:
+                    key='drs/%s/%s/%s-%s.json'%(e.get('Account','acct'), iid or 'unknown', event or 'event', ts.replace(':','-'))
+                    boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json.dumps(rec).encode(), ContentType='application/json')
+                    out['s3']='s3://%s/%s'%(bucket,key)
+                except Exception as ex: out['s3Error']=str(ex)
+            return out
+    isEnd: true
 
   - name: getPlatform
     action: aws:executeAwsApi
@@ -293,18 +451,21 @@ mainSteps:
           - 'TARGET_REGION="{{ TargetRegion }}"'
           - 'S3_HOST="aws-elastic-disaster-recovery-${TARGET_REGION}.s3.${TARGET_REGION}.amazonaws.com"'
           - '# Restart-first: if the agent is installed (unit loaded OR agent dir present), try restarting it.'
-          - '# Only reinstall if restart fails to bring the service active — reinstall forces a resync (RPO hit), so avoid it when a restart suffices.'
+          - '# Only reinstall if restart fails to bring the service active.'
           - 'if systemctl cat aws-replication-agent >/dev/null 2>&1 || [ -d /var/lib/aws-replication-agent ]; then'
           - '  echo "[INFO] agent installed, attempting restart"'
           - '  systemctl restart aws-replication-agent 2>/dev/null || true; sleep 3'
           - '  if systemctl is-active --quiet aws-replication-agent; then echo "[RESULT] HEALED_RESTART"; exit 0; fi'
           - '  echo "[INFO] restart did not bring agent active; proceeding to reinstall"'
           - 'fi'
-          - 'echo "[INFO] agent missing or unrecoverable, reinstalling"'
-          - '# Clean stale installer processes / partial-install state before reinstall'
+          - 'echo "[INFO] agent missing or unrecoverable, reinstalling in place"'
+          - '# Clean stale installer processes before reinstall'
           - 'pkill -f aws-replication-installer 2>/dev/null || true; sleep 2'
           - 'rm -f /tmp/aws-replication-installer-64bit /tmp/aws-replication-installer-init.py'
-          - 'if [ -d /var/lib/aws-replication-agent ] && ! systemctl is-active --quiet aws-replication-agent; then rm -rf /var/lib/aws-replication-agent; fi'
+          - '# Do NOT remove /var/lib/aws-replication-agent — re-running the installer'
+          - '# with the agent directory present preserves driver state and avoids a'
+          - '# full-disk rescan. The installer detects existing state and takes the'
+          - '# driver-preserving upgrade path.'
           - 'cd /tmp'
           - 'mount | grep -q "on /tmp type tmpfs" && mount -o remount,size=2G /tmp 2>/dev/null || true'
           - 'wget -q -O ./aws-replication-installer-init.py "https://${S3_HOST}/latest/linux/aws-replication-installer-init.py" || { echo "[ERROR] download failed"; exit 1; }'
@@ -331,12 +492,12 @@ mainSteps:
           - 'if (-not $acquired) { Write-Output "[RESULT] SKIPPED_LOCKED - another DRS run is in progress"; exit 0 }'
           - 'try {'
           - '  $svc = Get-Service -Name "AwsReplicationService" -ErrorAction SilentlyContinue'
-          - '  # Restart-first: only reinstall if restart fails to bring the service Running (reinstall forces a resync / RPO hit)'
+          - '  # Restart-first: only reinstall if restart fails to bring the service Running'
           - '  if ($svc) { try { Restart-Service "AwsReplicationService" -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 3; $svc = Get-Service -Name "AwsReplicationService" -ErrorAction SilentlyContinue; if ($svc -and $svc.Status -eq "Running") { Write-Output "[RESULT] HEALED_RESTART"; exit 0 } } catch {}; Write-Output "[INFO] restart did not bring service Running; proceeding to reinstall" }'
-          - '  # Clean partial-install state before reinstall'
+          - '  # Clean stale installer processes before reinstall'
           - '  Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "AwsReplication|replication-installer" } | Stop-Process -Force -ErrorAction SilentlyContinue'
-          - '  $agentDir = "C:\Program Files (x86)\AWS Replication Agent"'
-          - '  if (Test-Path $agentDir) { Remove-Item -Path $agentDir -Recurse -Force -ErrorAction SilentlyContinue }'
+          - '  # Do NOT remove the agent directory — re-running the installer preserves'
+          - '  # driver state and avoids a full-disk rescan.'
           - '  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12'
           - '  $path = "$env:TEMP\AwsReplicationWindowsInstaller.exe"'
           - '  Invoke-WebRequest -Uri "https://$S3Host/latest/windows/AwsReplicationWindowsInstaller.exe" -OutFile $path -UseBasicParsing'
@@ -407,7 +568,7 @@ mainSteps:
         Account: '{{ global:ACCOUNT_ID }}'
         InstanceId: '{{ normalizeInstanceId.InstanceId }}'
         Event: 'HEAL'
-        Status: 'FAILED'
+        Status: 'HEAL_FAILED'
         Detail: 'Self-heal failed; replication may be breaching RPO. Check the Run Command output.'
         SnsTopicArn: '{{ SnsTopicArn }}'
         Subject: '[DRS Heal FAILED] {{ normalizeInstanceId.InstanceId }}'
