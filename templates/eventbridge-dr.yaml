@@ -42,6 +42,9 @@ Resources:
           - aws.drs
         detail-type:
           - DRS Source Server Data Replication Stalled Change
+          detail:
+          state:
+            - STALLED
       Targets:
         - Id: ForwardToSourceRegion
           Arn: !Sub 'arn:aws:events:${SourceRegion}:${AccountId}:event-bus/default'
