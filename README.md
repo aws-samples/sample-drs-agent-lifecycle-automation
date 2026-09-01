@@ -267,6 +267,37 @@ aws ssm delete-parameter --name /drs/control/event-in-progress --region $SOURCE_
 
 See [CONTRIBUTING](CONTRIBUTING.md) for information on reporting security issues.
 
+## Cost
+
+This automation uses AWS services that incur costs based on usage. There are no upfront fees or minimum commitments. The following table estimates monthly costs for a fleet of 100 EC2 instances in the US East (N. Virginia) Region.
+
+| Service | Usage driver | Estimated monthly cost |
+| --- | --- | --- |
+| **SSM Automation** | Onboarding: 100 instances × 48 runs/day = 4,800 step executions/day. First 100,000 steps/month free | **$0** (within free tier for ≤100 instances) |
+| **SSM Run Command** | One command per automation run. Free tier: 1,500,000 invocations/month | **$0** |
+| **State Manager** | One association (tag:DR=yes, 30-min rate). Free | **$0** |
+| **EventBridge** | Custom events (tag changes, stalled events). $1.00 per million events | **< $0.01** |
+| **SNS** | Notifications on failures and offboarding. First 1,000 emails/month free | **$0** (typical fleets) |
+| **S3** | Audit JSON reports (~1 KB each). Storage: $0.023/GB. At 4,800 reports/day ≈ 144 MB/month | **< $0.01** |
+| **CloudWatch** | Custom metrics (Outcome per event type). $0.30/metric/month | **~$0.90** (3 metrics) |
+| **Parameter Store** | Standard parameters. Free | **$0** |
+
+**Estimated total for 100 instances: < $1/month** for the automation infrastructure itself.
+
+### What this does NOT include
+
+- **DRS replication costs** — hourly per-server charge, replication server EC2 instances, staging EBS volumes. These are DRS service costs, not automation costs. See [AWS DRS pricing](https://aws.amazon.com/disaster-recovery/pricing/).
+- **EC2 instance costs** — your source instances are billed independently of this automation.
+- **Data transfer** — cross-Region data transfer for replication is billed by DRS, not by this automation. The automation's cross-Region API calls (boto3 to the DR Region) transfer negligible data.
+
+### Scaling notes
+
+- At **1,000 instances**, SSM Automation steps exceed the free tier (~144,000 steps/month). Overage is $0.00025/step, adding approximately **$11/month**.
+- At **10,000 instances**, expect approximately **$110/month** for SSM Automation steps. Consider increasing the State Manager schedule interval (e.g., 60 minutes instead of 30) to halve step costs.
+- S3 and CloudWatch costs scale linearly but remain negligible at all fleet sizes.
+
+
+
 ## License
 
 This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file.
