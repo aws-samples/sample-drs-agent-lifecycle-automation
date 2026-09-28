@@ -30,6 +30,7 @@ if command -v yq &> /dev/null && [ -f "$CONFIG_FILE" ]; then
   SNS_TOPIC_NAME=$(yq '.sns_topic_name' "$CONFIG_FILE")
   AUDIT_BUCKET=$(yq '.audit_bucket_name' "$CONFIG_FILE")
   AUTO_INSTALL=$(yq '.auto_install_enabled' "$CONFIG_FILE")
+  AUTO_OFFBOARD=$(yq '.auto_offboard_enabled' "$CONFIG_FILE")
   IAM_STACK=$(yq '.iam_stack_name' "$CONFIG_FILE")
   EB_SOURCE_STACK=$(yq '.eventbridge_source_stack_name' "$CONFIG_FILE")
   EB_DR_STACK=$(yq '.eventbridge_dr_stack_name' "$CONFIG_FILE")
@@ -47,6 +48,7 @@ else
   SNS_TOPIC_NAME="drs-alerts"
   AUDIT_BUCKET=""
   AUTO_INSTALL="false"
+  AUTO_OFFBOARD="false"
   IAM_STACK="drs-automation-iam"
   EB_SOURCE_STACK="drs-eventbridge-source"
   EB_DR_STACK="drs-eventbridge-dr"
@@ -67,6 +69,7 @@ echo "  Source Region:  $SOURCE_REGION"
 echo "  DR Region:      $DR_REGION"
 echo "  Account ID:     $ACCOUNT_ID"
 echo "  Auto-Install:   $AUTO_INSTALL"
+echo "  Auto-Offboard:  $AUTO_OFFBOARD"
 echo "  SNS Topic:      $SNS_TOPIC_ARN"
 echo "  Audit Bucket:   ${AUDIT_BUCKET:-'(disabled)'}"
 echo ""
@@ -127,6 +130,7 @@ aws cloudformation deploy \
     DrTagKey="$DR_TAG_KEY" \
     SNSTopicArn="$SNS_TOPIC_ARN" \
     AuditBucket="$AUDIT_BUCKET" \
+    AutoOffboardEnabled="$AUTO_OFFBOARD" \
   --no-fail-on-empty-changeset
 
 echo "✅ EventBridge source rules deployed"
@@ -153,10 +157,20 @@ echo "✅ EventBridge DR forwarding rule deployed"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Step 5: Deploy State Manager Association
+# Step 5: Initialize Parameter Store
 # ---------------------------------------------------------------------------
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Step 5/6: Deploying State Manager Association..."
+echo "Step 5/6: Initializing Parameter Store..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+"$SCRIPT_DIR/init-parameters.sh"
+echo ""
+
+# ---------------------------------------------------------------------------
+# Step 6: Deploy State Manager Association
+# ---------------------------------------------------------------------------
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Step 6/6: Deploying State Manager Association..."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 aws cloudformation deploy \
@@ -176,16 +190,6 @@ aws cloudformation deploy \
   --no-fail-on-empty-changeset
 
 echo "✅ State Manager association deployed"
-echo ""
-
-# ---------------------------------------------------------------------------
-# Step 6: Initialize Parameter Store
-# ---------------------------------------------------------------------------
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Step 6/6: Initializing Parameter Store..."
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-"$SCRIPT_DIR/init-parameters.sh"
 echo ""
 
 # ---------------------------------------------------------------------------
