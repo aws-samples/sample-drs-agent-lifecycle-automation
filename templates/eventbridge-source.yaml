@@ -43,6 +43,14 @@ Parameters:
     Description: S3 bucket for audit logs (optional)
     Default: ''
 
+  AutoOffboardEnabled:
+    Type: String
+    Description: 'true = run teardown when an instance is descoped; false = notify only (audit mode)'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+
 # =============================================================================
 # Resources
 # =============================================================================
@@ -84,7 +92,7 @@ Resources:
               {
                 "InstanceTarget": [<instance>],
                 "TargetRegion": ["${TargetRegion}"],
-                "AutoOffboardEnabled": ["true"],
+                "AutoOffboardEnabled": ["${AutoOffboardEnabled}"],
                 "SnsTopicArn": ["${SNSTopicArn}"],
                 "AuditBucket": ["${AuditBucket}"],
                 "AutomationAssumeRole": ["${AutomationRoleArn}"]
@@ -108,7 +116,7 @@ Resources:
           - aws.drs
         detail-type:
           - DRS Source Server Data Replication Stalled Change
-          detail:
+        detail:
           state:
             - STALLED
       Targets:

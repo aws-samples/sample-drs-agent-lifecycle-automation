@@ -42,7 +42,7 @@ Resources:
           - aws.drs
         detail-type:
           - DRS Source Server Data Replication Stalled Change
-          detail:
+        detail:
           state:
             - STALLED
       Targets:
