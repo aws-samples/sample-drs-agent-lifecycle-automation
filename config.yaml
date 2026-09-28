@@ -16,10 +16,10 @@ audit_bucket_name: ""             # S3 bucket for JSON audit logs (empty = skip 
 cloudwatch_namespace: DRSAutomation  # CloudWatch metric namespace
 
 # --- Automation Toggles ------------------------------------------------------
-# IMPORTANT: Start with auto_install_enabled=false (audit mode) to validate
-# the automation detects instances correctly before enabling auto-install.
+# IMPORTANT: Start with both toggles set to "false" (audit mode) to validate
+# what the automation would do before turning on install and teardown.
 auto_install_enabled: "false"     # false = audit-only (detect + report); true = install/repair
-auto_offboard_enabled: "true"     # true = execute teardown on descope; false = notify only
+auto_offboard_enabled: "false"    # false = notify only (audit mode); true = execute teardown on descope
 
 # --- Tag Configuration -------------------------------------------------------
 dr_tag_key: DR                    # EC2 tag key that controls the lifecycle
